@@ -169,13 +169,35 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # First, try to create the 'release' label if it doesn't exist
+          # This will fail silently if the label already exists
           curl -s -X POST \
             -H "Authorization: token $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/issues/${{ steps.create_pr.outputs.pr_number }}/labels \
-            -d '{"labels": ["release", "automated"]}'
+            https://api.github.com/repos/${{ github.repository }}/labels \
+            -d '{"name": "release", "color": "0E8A16", "description": "Release PR"}' || true
 
-          echo "✅ Added release labels"
+          # Try to create the 'automated' label if it doesn't exist
+          curl -s -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/labels \
+            -d '{"name": "automated", "color": "EDEDED", "description": "Automated PR"}' || true
+
+          # Now add the labels to the PR
+          LABEL_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/issues/${{ steps.create_pr.outputs.pr_number }}/labels \
+            -d '{"labels": ["release", "automated"]}')
+
+          # Check if labels were added successfully
+          if echo "$LABEL_RESPONSE" | grep -q '"name":[[:space:]]*"release"'; then
+            echo "✅ Added release labels"
+          else
+            echo "⚠️ Warning: Could not add labels to PR (labels may not exist in the repository)"
+            echo "Response: $LABEL_RESPONSE"
+          fi
 
       - name: Summary
         run: |
