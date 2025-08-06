@@ -145,8 +145,8 @@ jobs:
               "body": "## 🚀 Release v${{ steps.new_version.outputs.version }}\n\nThis PR contains the version bump for the **${{ inputs.version_type }}** release from `${{ steps.current_version.outputs.version }}` to `${{ steps.new_version.outputs.version }}`.\n\n### Release Type\n- **Type:** ${{ inputs.version_type }}\n- **From:** v${{ steps.current_version.outputs.version }}\n- **To:** v${{ steps.new_version.outputs.version }}\n\n### What happens next?\n1. **Tests will run automatically** on this PR\n2. **Review and approve** when tests pass\n3. **Merge the PR** to trigger:\n   - Automatic tagging as v${{ steps.new_version.outputs.version }}\n   - Production deployment\n\n### Checklist\n- [ ] Tests pass\n- [ ] Ready for production\n\n---\n*This PR was automatically created by the release workflow*"
             }')
 
-          PR_NUMBER=$(echo "$PR_RESPONSE" | grep -o '"number":[0-9]*' | head -1 | cut -d':' -f2)
-          PR_URL=$(echo "$PR_RESPONSE" | grep -o '"html_url":"[^"]*' | head -1 | cut -d'"' -f4)
+          PR_NUMBER=$(echo "$PR_RESPONSE" | grep -o '"number":[[:space:]]*[0-9]*' | head -1 | sed 's/.*:[[:space:]]*//')
+          PR_URL=$(echo "$PR_RESPONSE" | grep -o '"html_url":[[:space:]]*"[^"]*' | head -1 | cut -d'"' -f4)
 
           if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ]; then
             echo "❌ Failed to create PR"
