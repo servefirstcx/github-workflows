@@ -1,0 +1,133 @@
+name: Reusable Tag Release Workflow
+
+on:
+  workflow_call:
+    inputs:
+      main_branch:
+        description: "Production branch name"
+        required: false
+        type: string
+        default: "main"
+      package_file:
+        description: "Package file path"
+        required: false
+        type: string
+        default: "package.json"
+      bot_name:
+        description: "Git bot name"
+        required: false
+        type: string
+        default: "github-actions[bot]"
+      bot_email:
+        description: "Git bot email"
+        required: false
+        type: string
+        default: "github-actions[bot]@users.noreply.github.com"
+      release_label:
+        description: "Label that identifies release PRs"
+        required: false
+        type: string
+        default: "release"
+      tag_prefix:
+        description: "Prefix for version tags"
+        required: false
+        type: string
+        default: "v"
+
+permissions:
+  contents: write
+
+jobs:
+  tag-release:
+    name: Tag Release
+    runs-on: ubuntu-latest
+    # Only run if PR was merged and has the release label
+    if: github.event.pull_request.merged == true && contains(github.event.pull_request.labels.*.name, inputs.release_label)
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.main_branch }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "${{ inputs.bot_name }}"
+          git config user.email "${{ inputs.bot_email }}"
+
+      - name: Get version from package.json
+        id: get_version
+        run: |
+          VERSION=$(grep '"version"' ${{ inputs.package_file }} | sed -E 's/.*"version":\s*"([^"]*)".*/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version to tag: $VERSION"
+
+      - name: Check if tag already exists
+        id: check_tag
+        run: |
+          TAG="${{ inputs.tag_prefix }}${{ steps.get_version.outputs.version }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Tag $TAG already exists"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Tag $TAG does not exist"
+          fi
+
+      - name: Create and push tag
+        if: steps.check_tag.outputs.exists == 'false'
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          TAG="${{ inputs.tag_prefix }}$VERSION"
+
+          # Create annotated tag
+          git tag -a "$TAG" -m "Release version $VERSION"
+
+          # Push tag to remote
+          git push origin "$TAG"
+
+          echo "✅ Created and pushed tag: $TAG"
+
+      - name: Create GitHub Release
+        if: steps.check_tag.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_prefix }}${{ steps.get_version.outputs.version }}
+          name: Release ${{ inputs.tag_prefix }}${{ steps.get_version.outputs.version }}
+          body: |
+            ## 🚀 Release ${{ inputs.tag_prefix }}${{ steps.get_version.outputs.version }}
+
+            ### Changes
+            This release was created from PR #${{ github.event.pull_request.number }}: ${{ github.event.pull_request.title }}
+
+            ### Deployment
+            - ✅ Version bumped to ${{ steps.get_version.outputs.version }}
+            - ✅ Tagged as ${{ inputs.tag_prefix }}${{ steps.get_version.outputs.version }}
+            - 🚀 Production deployment triggered automatically
+
+            ### Pull Request
+            - **PR:** #${{ github.event.pull_request.number }}
+            - **Merged by:** @${{ github.event.pull_request.merged_by.login }}
+            - **Merged at:** ${{ github.event.pull_request.merged_at }}
+
+            ---
+            View deployment status in the [Actions tab](https://github.com/${{ github.repository }}/actions)
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+
+      - name: Add summary
+        run: |
+          echo "## ✅ Release Tagged" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Version Information" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version:** ${{ inputs.tag_prefix }}${{ steps.get_version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tag:** ${{ inputs.tag_prefix }}${{ steps.get_version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **PR:** #${{ github.event.pull_request.number }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### What happens next?" >> $GITHUB_STEP_SUMMARY
+          echo "- The deployment workflow will automatically deploy to production" >> $GITHUB_STEP_SUMMARY
+          echo "- A GitHub Release has been created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "[View Release](https://github.com/${{ github.repository }}/releases/tag/${{ inputs.tag_prefix }}${{ steps.get_version.outputs.version }})" >> $GITHUB_STEP_SUMMARY

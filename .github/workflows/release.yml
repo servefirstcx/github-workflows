@@ -1,0 +1,193 @@
+name: Reusable Release Workflow
+
+on:
+  workflow_call:
+    inputs:
+      version_type:
+        description: "Version type (major, minor, patch)"
+        required: true
+        type: string
+      staging_branch:
+        description: "Staging/development branch name"
+        required: false
+        type: string
+        default: "stage"
+      main_branch:
+        description: "Production branch name"
+        required: false
+        type: string
+        default: "main"
+      package_file:
+        description: "Package file path"
+        required: false
+        type: string
+        default: "package.json"
+      package_lock:
+        description: "Package lock file path"
+        required: false
+        type: string
+        default: "package-lock.json"
+      bot_name:
+        description: "Git bot name"
+        required: false
+        type: string
+        default: "github-actions[bot]"
+      bot_email:
+        description: "Git bot email"
+        required: false
+        type: string
+        default: "github-actions[bot]@users.noreply.github.com"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  create-release-pr:
+    name: Create Release PR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.staging_branch }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "${{ inputs.bot_name }}"
+          git config user.email "${{ inputs.bot_email }}"
+
+      - name: Get current version
+        id: current_version
+        run: |
+          CURRENT_VERSION=$(grep '"version"' ${{ inputs.package_file }} | sed -E 's/.*"version":\s*"([^"]*)".*/\1/')
+          echo "version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "📌 Current version: $CURRENT_VERSION"
+
+      - name: Calculate new version
+        id: new_version
+        run: |
+          CURRENT_VERSION="${{ steps.current_version.outputs.version }}"
+          VERSION_TYPE="${{ inputs.version_type }}"
+
+          IFS='.' read -r major minor patch <<< "$CURRENT_VERSION"
+
+          case $VERSION_TYPE in
+            major)
+              NEW_VERSION="$((major+1)).0.0"
+              ;;
+            minor)
+              NEW_VERSION="$major.$((minor+1)).0"
+              ;;
+            patch)
+              NEW_VERSION="$major.$minor.$((patch+1))"
+              ;;
+          esac
+
+          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "🚀 New version will be: $NEW_VERSION"
+
+      - name: Create release branch
+        run: |
+          RELEASE_BRANCH="release/${{ steps.new_version.outputs.version }}"
+          git checkout -b "$RELEASE_BRANCH"
+          echo "✅ Created branch: $RELEASE_BRANCH"
+
+      - name: Update version in package.json
+        run: |
+          NEW_VERSION="${{ steps.new_version.outputs.version }}"
+
+          # Update package.json
+          sed -i "s/\"version\": \".*\"/\"version\": \"$NEW_VERSION\"/" ${{ inputs.package_file }}
+
+          # For Node.js projects, properly update package-lock.json using npm
+          if [ -f "${{ inputs.package_lock }}" ]; then
+            # Update package-lock.json properly without modifying dependencies
+            npm install --package-lock-only --ignore-scripts
+          fi
+
+          echo "✅ Updated version to $NEW_VERSION"
+
+      - name: Commit version bump
+        run: |
+          # Add the version files
+          git add ${{ inputs.package_file }}
+
+          # Add lock file if it exists
+          if [ -f "${{ inputs.package_lock }}" ]; then
+            git add ${{ inputs.package_lock }}
+          fi
+
+          git commit -m "chore: bump version to ${{ steps.new_version.outputs.version }}"
+          echo "✅ Committed version bump"
+
+      - name: Push release branch
+        run: |
+          git push origin "release/${{ steps.new_version.outputs.version }}"
+          echo "✅ Pushed release branch to remote"
+
+      - name: Create Pull Request
+        id: create_pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Create PR using GitHub API
+          PR_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/pulls \
+            -d '{
+              "title": "🚀 Release v${{ steps.new_version.outputs.version }}",
+              "head": "release/${{ steps.new_version.outputs.version }}",
+              "base": "${{ inputs.main_branch }}",
+              "body": "## 🚀 Release v${{ steps.new_version.outputs.version }}\n\nThis PR contains the version bump for the **${{ inputs.version_type }}** release from `${{ steps.current_version.outputs.version }}` to `${{ steps.new_version.outputs.version }}`.\n\n### Release Type\n- **Type:** ${{ inputs.version_type }}\n- **From:** v${{ steps.current_version.outputs.version }}\n- **To:** v${{ steps.new_version.outputs.version }}\n\n### What happens next?\n1. **Tests will run automatically** on this PR\n2. **Review and approve** when tests pass\n3. **Merge the PR** to trigger:\n   - Automatic tagging as v${{ steps.new_version.outputs.version }}\n   - Production deployment\n\n### Checklist\n- [ ] Tests pass\n- [ ] Ready for production\n\n---\n*This PR was automatically created by the release workflow*"
+            }')
+
+          PR_NUMBER=$(echo "$PR_RESPONSE" | grep -o '"number":[0-9]*' | head -1 | cut -d':' -f2)
+          PR_URL=$(echo "$PR_RESPONSE" | grep -o '"html_url":"[^"]*' | head -1 | cut -d'"' -f4)
+
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+
+          echo "✅ Created PR #$PR_NUMBER"
+          echo "📎 URL: $PR_URL"
+
+      - name: Add release label to PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/issues/${{ steps.create_pr.outputs.pr_number }}/labels \
+            -d '{"labels": ["release", "automated"]}'
+
+          echo "✅ Added release labels"
+
+      - name: Summary
+        run: |
+          echo "## 🚀 Release PR Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Version Information" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Type** | ${{ inputs.version_type }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **From** | v${{ steps.current_version.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **To** | v${{ steps.new_version.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Branch** | release/${{ steps.new_version.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Pull Request" >> $GITHUB_STEP_SUMMARY
+          echo "- **PR:** [#${{ steps.create_pr.outputs.pr_number }}](${{ steps.create_pr.outputs.pr_url }})" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status:** Open for review" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. ⏳ Wait for tests to complete" >> $GITHUB_STEP_SUMMARY
+          echo "2. ✅ Review and approve the PR" >> $GITHUB_STEP_SUMMARY
+          echo "3. 🚀 Merge to trigger:" >> $GITHUB_STEP_SUMMARY
+          echo "   - Automatic tagging" >> $GITHUB_STEP_SUMMARY
+          echo "   - Production deployment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "[View Pull Request](${{ steps.create_pr.outputs.pr_url }}) →" >> $GITHUB_STEP_SUMMARY
