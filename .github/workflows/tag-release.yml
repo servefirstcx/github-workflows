@@ -41,22 +41,38 @@ jobs:
   tag-release:
     name: Tag Release
     runs-on: ubuntu-latest
-    # Only run if PR was merged and has the release label
-    if: github.event.pull_request.merged == true && contains(github.event.pull_request.labels.*.name, inputs.release_label)
+    # Check if PR was merged (can't check label here in reusable workflow)
+    if: github.event.pull_request.merged == true
 
     steps:
+      - name: Check release label
+        id: check_label
+        run: |
+          # Check if the PR has the release label
+          if [[ "${{ contains(github.event.pull_request.labels.*.name, inputs.release_label) }}" == "true" ]]; then
+            echo "has_release_label=true" >> $GITHUB_OUTPUT
+            echo "✅ PR has the '${{ inputs.release_label }}' label"
+          else
+            echo "has_release_label=false" >> $GITHUB_OUTPUT
+            echo "⏭️ Skipping - PR does not have the '${{ inputs.release_label }}' label"
+            echo "Labels found: ${{ join(github.event.pull_request.labels.*.name, ', ') }}"
+          fi
+
       - name: Checkout code
+        if: steps.check_label.outputs.has_release_label == 'true'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: ${{ inputs.main_branch }}
 
       - name: Configure Git
+        if: steps.check_label.outputs.has_release_label == 'true'
         run: |
           git config user.name "${{ inputs.bot_name }}"
           git config user.email "${{ inputs.bot_email }}"
 
       - name: Get version from package.json
+        if: steps.check_label.outputs.has_release_label == 'true'
         id: get_version
         run: |
           VERSION=$(grep '"version"' ${{ inputs.package_file }} | sed -E 's/.*"version":\s*"([^"]*)".*/\1/')
@@ -64,6 +80,7 @@ jobs:
           echo "Version to tag: $VERSION"
 
       - name: Check if tag already exists
+        if: steps.check_label.outputs.has_release_label == 'true'
         id: check_tag
         run: |
           TAG="${{ inputs.tag_prefix }}${{ steps.get_version.outputs.version }}"
@@ -76,7 +93,7 @@ jobs:
           fi
 
       - name: Create and push tag
-        if: steps.check_tag.outputs.exists == 'false'
+        if: steps.check_label.outputs.has_release_label == 'true' && steps.check_tag.outputs.exists == 'false'
         run: |
           VERSION="${{ steps.get_version.outputs.version }}"
           TAG="${{ inputs.tag_prefix }}$VERSION"
@@ -90,7 +107,7 @@ jobs:
           echo "✅ Created and pushed tag: $TAG"
 
       - name: Create GitHub Release
-        if: steps.check_tag.outputs.exists == 'false'
+        if: steps.check_label.outputs.has_release_label == 'true' && steps.check_tag.outputs.exists == 'false'
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ inputs.tag_prefix }}${{ steps.get_version.outputs.version }}
@@ -118,6 +135,7 @@ jobs:
           generate_release_notes: true
 
       - name: Add summary
+        if: steps.check_label.outputs.has_release_label == 'true'
         run: |
           echo "## ✅ Release Tagged" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -129,5 +147,6 @@ jobs:
           echo "### What happens next?" >> $GITHUB_STEP_SUMMARY
           echo "- The deployment workflow will automatically deploy to production" >> $GITHUB_STEP_SUMMARY
           echo "- A GitHub Release has been created" >> $GITHUB_STEP_SUMMARY
+          echo "- The sync workflow will create a PR to merge changes back to staging" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "[View Release](https://github.com/${{ github.repository }}/releases/tag/${{ inputs.tag_prefix }}${{ steps.get_version.outputs.version }})" >> $GITHUB_STEP_SUMMARY

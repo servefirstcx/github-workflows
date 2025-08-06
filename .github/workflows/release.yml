@@ -148,6 +148,17 @@ jobs:
           PR_NUMBER=$(echo "$PR_RESPONSE" | grep -o '"number":[0-9]*' | head -1 | cut -d':' -f2)
           PR_URL=$(echo "$PR_RESPONSE" | grep -o '"html_url":"[^"]*' | head -1 | cut -d'"' -f4)
 
+          if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ]; then
+            echo "❌ Failed to create PR"
+            echo "Response: $PR_RESPONSE"
+            echo ""
+            echo "Common causes:"
+            echo "  - A PR already exists from this branch"
+            echo "  - No changes between branches"
+            echo "  - Permission issues"
+            exit 1
+          fi
+
           echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
           echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
 

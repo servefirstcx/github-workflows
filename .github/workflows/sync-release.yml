@@ -63,16 +63,23 @@ This PR automatically syncs the release v${{ steps.get_version.outputs.VERSION }
 ---
 *This PR was automatically created after tagging release v${{ steps.get_version.outputs.VERSION }}*" \
             --label "release-sync" \
-            --label "automated" || echo "PR_EXISTS")
+            --label "automated" 2>&1 || echo "PR_CREATE_FAILED")
           
-          if [ "$PR_URL" != "PR_EXISTS" ]; then
+          if [ "$PR_URL" = "PR_CREATE_FAILED" ] || [ -z "$PR_URL" ]; then
+            echo "ℹ️ Could not create PR - likely already exists or branches are up to date"
+            # Check if PR already exists
+            EXISTING_PR=$(gh pr list --base "${{ inputs.staging_branch }}" --head "${{ inputs.main_branch }}" --json number --jq '.[0].number' || echo "")
+            if [ -n "$EXISTING_PR" ]; then
+              echo "✅ Found existing PR #$EXISTING_PR"
+              echo "PR_NUMBER=$EXISTING_PR" >> $GITHUB_OUTPUT
+            else
+              echo "ℹ️ No sync needed - branches may already be in sync"
+            fi
+          else
             echo "✅ Created PR: $PR_URL"
-            
             # Extract PR number from URL for next step
             PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$')
             echo "PR_NUMBER=$PR_NUMBER" >> $GITHUB_OUTPUT
-          else
-            echo "ℹ️ PR already exists or cannot be created (branches may be up to date)"
           fi
 
       - name: Enable auto-merge
