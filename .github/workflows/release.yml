@@ -119,8 +119,9 @@ jobs:
           NEW_VERSION="${{ steps.new_version.outputs.version }}"
           OLD_VERSION="${{ steps.current_version.outputs.version }}"
 
-          # Update package.json
-          sed -i "s/\"version\": \".*\"/\"version\": \"$NEW_VERSION\"/" ${{ inputs.package_file }}
+          # Update package.json using jq for precise JSON manipulation
+          echo "📝 Updating package.json version..."
+          jq --arg new_version "$NEW_VERSION" '.version = $new_version' ${{ inputs.package_file }} > temp_package.json && mv temp_package.json ${{ inputs.package_file }}
 
           # For Node.js projects, update package-lock.json without regenerating it
           if [ -f "${{ inputs.package_lock }}" ]; then
