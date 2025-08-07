@@ -33,6 +33,10 @@ on:
         required: false
         type: string
         default: "v"
+    secrets:
+      RELEASE_TOKEN:
+        description: "Personal Access Token for creating tags that trigger other workflows (optional, falls back to GITHUB_TOKEN)"
+        required: false
 
 permissions:
   contents: write
@@ -64,6 +68,8 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ inputs.main_branch }}
+          # Use PAT if provided, otherwise use default token
+          token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Configure Git
         if: steps.check_label.outputs.has_release_label == 'true'
@@ -102,9 +108,18 @@ jobs:
           git tag -a "$TAG" -m "Release version $VERSION"
 
           # Push tag to remote
+          # This will use the token from the checkout step
           git push origin "$TAG"
 
           echo "✅ Created and pushed tag: $TAG"
+
+          # Add note about whether workflows will be triggered
+          if [[ -n "${{ secrets.RELEASE_TOKEN }}" ]]; then
+            echo "📢 Tag pushed with PAT - will trigger other workflows (e.g., sync-release)"
+          else
+            echo "⚠️ Tag pushed with GITHUB_TOKEN - won't trigger other workflows"
+            echo "   To enable workflow triggering, pass a PAT as RELEASE_TOKEN secret"
+          fi
 
       - name: Create GitHub Release
         if: steps.check_label.outputs.has_release_label == 'true' && steps.check_tag.outputs.exists == 'false'
