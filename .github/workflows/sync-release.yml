@@ -42,29 +42,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Use GitHub CLI to create PR (it's built into GitHub Actions)
+          PR_BODY="## 🔄 Release Sync\n\nThis PR automatically syncs the release v${{ steps.get_version.outputs.VERSION }} from \`${{ inputs.main_branch }}\` back to \`${{ inputs.staging_branch }}\`.\n\n### Why is this needed?\n- Keeps \`${{ inputs.staging_branch }}\` up-to-date with production releases\n- Ensures version numbers stay in sync\n- Prevents merge conflicts in future releases\n\n### What's included?\n- Version bump to ${{ steps.get_version.outputs.VERSION }}\n- Any hotfixes or changes made during the release process\n- The tagged commit from production\n\n---\n*This PR was automatically created after tagging release v${{ steps.get_version.outputs.VERSION }}*"
+
           PR_URL=$(gh pr create \
             --base "${{ inputs.staging_branch }}" \
             --head "${{ inputs.main_branch }}" \
             --title "🔄 Sync Release v${{ steps.get_version.outputs.VERSION }} back to ${{ inputs.staging_branch }}" \
-            --body "## 🔄 Release Sync
-
-This PR automatically syncs the release v${{ steps.get_version.outputs.VERSION }} from \`${{ inputs.main_branch }}\` back to \`${{ inputs.staging_branch }}\`.
-
-### Why is this needed?
-- Keeps \`${{ inputs.staging_branch }}\` up-to-date with production releases
-- Ensures version numbers stay in sync
-- Prevents merge conflicts in future releases
-
-### What's included?
-- Version bump to ${{ steps.get_version.outputs.VERSION }}
-- Any hotfixes or changes made during the release process
-- The tagged commit from production
-
----
-*This PR was automatically created after tagging release v${{ steps.get_version.outputs.VERSION }}*" \
+            --body "$PR_BODY" \
             --label "release-sync" \
             --label "automated" 2>&1 || echo "PR_CREATE_FAILED")
-          
+
           if [ "$PR_URL" = "PR_CREATE_FAILED" ] || [ -z "$PR_URL" ]; then
             echo "ℹ️ Could not create PR - likely already exists or branches are up to date"
             # Check if PR already exists
@@ -89,4 +76,4 @@ This PR automatically syncs the release v${{ steps.get_version.outputs.VERSION }
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "🔍 Attempting to enable auto-merge for PR #${{ steps.create-pr.outputs.PR_NUMBER }}..."
-          gh pr merge ${{ steps.create-pr.outputs.PR_NUMBER }} --auto --merge 
+          gh pr merge ${{ steps.create-pr.outputs.PR_NUMBER }} --auto --merge
