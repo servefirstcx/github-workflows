@@ -100,20 +100,17 @@ jobs:
           NEW_VERSION="${{ steps.new_version.outputs.version }}"
           OLD_VERSION="${{ steps.current_version.outputs.version }}"
 
-          # Update package.json using jq for precise JSON manipulation
+          # Update package.json (line 3 is always the version in a standard package.json)
           echo "📝 Updating package.json version..."
-          jq --arg new_version "$NEW_VERSION" '.version = $new_version' ${{ inputs.package_file }} > temp_package.json && mv temp_package.json ${{ inputs.package_file }}
+          sed -i '3s/"version": "[^"]*"/"version": "'$NEW_VERSION'"/' ${{ inputs.package_file }}
 
-          # For Node.js projects, update package-lock.json without regenerating it
+          # Update package-lock.json if it exists
           if [ -f "${{ inputs.package_lock }}" ]; then
-            echo "📝 Updating package-lock.json version fields only..."
-            
-            # Use jq to safely update only the main package version fields
-            # This ensures we don't accidentally update dependency versions
-            jq --arg new_version "$NEW_VERSION" '
-              .version = $new_version |
-              .packages[""].version = $new_version
-            ' ${{ inputs.package_lock }} > temp_lock.json && mv temp_lock.json ${{ inputs.package_lock }}
+            echo "📝 Updating package-lock.json version fields..."
+            # Line 3: root version
+            sed -i '3s/"version": "[^"]*"/"version": "'$NEW_VERSION'"/' ${{ inputs.package_lock }}
+            # Line 9: packages[""] version (in lockfileVersion 2+)
+            sed -i '9s/"version": "[^"]*"/"version": "'$NEW_VERSION'"/' ${{ inputs.package_lock }}
           fi
 
           echo "✅ Updated version to $NEW_VERSION"
