@@ -91,9 +91,44 @@ jobs:
 
       - name: Enable auto-merge
         if: steps.create-pr.outputs.PR_NUMBER
+        id: auto-merge
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "🔍 Attempting to enable auto-merge for PR #${{ steps.create-pr.outputs.PR_NUMBER }}..."
-          gh pr merge ${{ steps.create-pr.outputs.PR_NUMBER }} --auto --merge
+
+          # Try to enable auto-merge
+          if gh pr merge ${{ steps.create-pr.outputs.PR_NUMBER }} --auto --merge 2>&1; then
+            echo "✅ Auto-merge enabled successfully"
+            echo "auto_merge_enabled=true" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Could not enable auto-merge (this is okay - might need manual review)"
+            echo "auto_merge_enabled=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Add summary
+        run: |
+          echo "## 🔄 Release Sync Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -n "${{ steps.create-pr.outputs.PR_NUMBER }}" ]; then
+            echo "### Pull Request #${{ steps.create-pr.outputs.PR_NUMBER }}" >> $GITHUB_STEP_SUMMARY
+            echo "A PR has been created to sync release v${{ steps.get_version.outputs.VERSION }} back to ${{ inputs.staging_branch }}." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "[View Pull Request](https://github.com/${{ github.repository }}/pull/${{ steps.create-pr.outputs.PR_NUMBER }})" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "${{ steps.auto-merge.outputs.auto_merge_enabled }}" = "true" ]; then
+              echo "✅ **Auto-merge enabled** - PR will merge automatically once checks pass" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "⚠️ **Manual merge required** - Please review and merge the PR" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "This usually means:" >> $GITHUB_STEP_SUMMARY
+              echo "- There might be merge conflicts to resolve" >> $GITHUB_STEP_SUMMARY
+              echo "- Branch protection rules require reviews" >> $GITHUB_STEP_SUMMARY
+              echo "- Or checks need to pass first" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "ℹ️ No PR needed - branches are already in sync or a PR already exists." >> $GITHUB_STEP_SUMMARY
+          fi
