@@ -54,25 +54,6 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.staging_branch }}
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version-file: ".nvmrc"
-
-      - name: Setup npm version
-        run: |
-          # Check if engines.npm is specified in package.json
-          if grep -q '"engines"' ${{ inputs.package_file }} && grep -q '"npm"' ${{ inputs.package_file }}; then
-            NPM_VERSION=$(node -p "require('./${{ inputs.package_file }}').engines.npm")
-            echo "📦 Installing npm version $NPM_VERSION from package.json engines"
-          else
-            # Default to npm 8.19.4 if not specified
-            NPM_VERSION="8.19.4"
-            echo "📦 Installing default npm version $NPM_VERSION"
-          fi
-          npm install -g npm@$NPM_VERSION
-          echo "✅ Using npm version: $(npm --version)"
-
       - name: Configure Git
         run: |
           git config user.name "${{ inputs.bot_name }}"
