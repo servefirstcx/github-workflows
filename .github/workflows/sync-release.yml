@@ -36,6 +36,26 @@ jobs:
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
           echo "📦 Syncing release v$VERSION back to ${{ inputs.staging_branch }}"
 
+      - name: Create labels if they don't exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "📌 Ensuring required labels exist..."
+
+          # Create 'release-sync' label if it doesn't exist
+          gh label create "release-sync" \
+            --description "PR to sync release back to staging" \
+            --color "0052CC" \
+            --force || echo "Label 'release-sync' already exists"
+
+          # Create 'automated' label if it doesn't exist  
+          gh label create "automated" \
+            --description "Automated PR" \
+            --color "EDEDED" \
+            --force || echo "Label 'automated' already exists"
+
+          echo "✅ Labels ready"
+
       - name: Create Pull Request
         id: create-pr
         env:
