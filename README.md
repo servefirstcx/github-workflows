@@ -16,6 +16,10 @@ Automatically tags releases when PRs are merged to main.
 
 Syncs releases back from main to stage.
 
+### 4. Hotfix Workflow (`hotfix.yml`)
+
+Creates a hotfix PR from `main` with a version bump (default: patch) and labels it as a release so your tagging workflow runs on merge. After tagging, your sync workflow can merge `main` back to `stage`.
+
 ## Usage
 
 To use these workflows in your repository, create minimal wrapper workflows that call these reusable ones.
