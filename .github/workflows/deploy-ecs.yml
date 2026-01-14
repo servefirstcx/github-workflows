@@ -1,0 +1,219 @@
+name: Reusable ECS Deployment Workflow
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        description: "Service name (e.g., 'pdf', 'email', 'notification')"
+        required: true
+        type: string
+      service_display_name:
+        description: "Display name for the service"
+        required: false
+        type: string
+      environment:
+        description: "Environment (staging or production)"
+        required: true
+        type: string
+      branch:
+        description: "Branch to deploy"
+        required: true
+        type: string
+      aws_region:
+        description: "AWS region"
+        required: false
+        type: string
+        default: "eu-west-2"
+      ecr_repository:
+        description: "ECR repository name"
+        required: true
+        type: string
+      ecs_service:
+        description: "ECS service name"
+        required: true
+        type: string
+      ecs_cluster:
+        description: "ECS cluster name"
+        required: true
+        type: string
+      version:
+        description: "Version from package.json"
+        required: false
+        type: string
+        default: "unknown"
+      is_release:
+        description: "Whether this is a release deployment"
+        required: false
+        type: boolean
+        default: false
+      has_tag:
+        description: "Whether a version tag exists"
+        required: false
+        type: boolean
+        default: false
+      commit_sha:
+        description: "Git commit SHA"
+        required: true
+        type: string
+    secrets:
+      AWS_ROLE_TO_ASSUME:
+        description: "AWS IAM role ARN to assume for deployment"
+        required: true
+      SLACK_WEBHOOK_URL:
+        description: "Slack webhook URL for notifications"
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-deploy:
+    name: Build and Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        id: build-image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr_repository }}:latest
+            ${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr_repository }}:${{ inputs.commit_sha }}
+            ${{ inputs.version != 'unknown' && format('{0}/{1}:{2}', steps.login-ecr.outputs.registry, inputs.ecr_repository, inputs.version) || '' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/arm64
+          provenance: false
+
+      - name: Get current task definition
+        id: task-def
+        run: |
+          TASK_DEF=$(aws ecs describe-services \
+            --cluster ${{ inputs.ecs_cluster }} \
+            --services ${{ inputs.ecs_service }} \
+            --region ${{ inputs.aws_region }} \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          echo "task-definition=$TASK_DEF" >> $GITHUB_OUTPUT
+          echo "Current task definition: $TASK_DEF"
+
+      - name: Register new task definition
+        id: register-task-def
+        run: |
+          # Get the current task definition JSON
+          TASK_DEF_JSON=$(aws ecs describe-task-definition \
+            --task-definition ${{ steps.task-def.outputs.task-definition }} \
+            --region ${{ inputs.aws_region }} \
+            --query 'taskDefinition' \
+            --output json)
+          
+          # Extract the image from the current task definition
+          CURRENT_IMAGE=$(echo "$TASK_DEF_JSON" | jq -r '.containerDefinitions[0].image')
+          echo "Current image: $CURRENT_IMAGE"
+          
+          # Build the new image tag (use commit SHA)
+          IMAGE_REPO=$(echo "$CURRENT_IMAGE" | sed 's/:.*//')
+          NEW_IMAGE_TAG="${{ inputs.commit_sha }}"
+          NEW_IMAGE="$IMAGE_REPO:$NEW_IMAGE_TAG"
+          echo "New image: $NEW_IMAGE"
+          
+          # Remove fields that can't be included in register-task-definition
+          TASK_DEF_JSON=$(echo "$TASK_DEF_JSON" | jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+          
+          # Update the image in the task definition
+          TASK_DEF_JSON=$(echo "$TASK_DEF_JSON" | jq --arg IMAGE "$NEW_IMAGE" '.containerDefinitions[0].image = $IMAGE')
+          
+          # Register the new task definition
+          NEW_TASK_DEF=$(aws ecs register-task-definition \
+            --cli-input-json "$TASK_DEF_JSON" \
+            --region ${{ inputs.aws_region }} \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          
+          echo "task-definition=$NEW_TASK_DEF" >> $GITHUB_OUTPUT
+          echo "✅ Registered new task definition: $NEW_TASK_DEF"
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ inputs.ecs_cluster }} \
+            --service ${{ inputs.ecs_service }} \
+            --task-definition ${{ steps.register-task-def.outputs.task-definition }} \
+            --region ${{ inputs.aws_region }}
+
+      - name: Wait for service stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ inputs.ecs_cluster }} \
+            --services ${{ inputs.ecs_service }} \
+            --region ${{ inputs.aws_region }}
+
+      - name: Create deployment summary
+        if: always()
+        run: |
+          echo "## 🚀 ${{ inputs.service_display_name }} Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Environment: ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ inputs.version }}" != "unknown" ]]; then
+            if [[ "${{ inputs.has_tag }}" == "true" ]]; then
+              echo "- **Version:** v${{ inputs.version }} 🏷️" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- **Version:** ${{ inputs.version }}" >> $GITHUB_STEP_SUMMARY
+            fi
+            if [[ "${{ inputs.is_release }}" == "true" ]]; then
+              echo "- **Type:** 🎉 Release Deployment" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- **Type:** Regular Deployment" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          echo "- **Branch:** ${{ inputs.branch }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** ${{ inputs.commit_sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **ECR Repository:** ${{ inputs.ecr_repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **ECS Service:** ${{ inputs.ecs_service }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **ECS Cluster:** ${{ inputs.ecs_cluster }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Task Definition:** ${{ steps.register-task-def.outputs.task-definition }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **AWS Region:** ${{ inputs.aws_region }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ job.status }}" == "success" ]]; then
+            echo "✅ **${{ inputs.environment }} deployment completed successfully!**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **${{ inputs.environment }} deployment failed!**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Send deployment notification
+        if: always() && secrets.SLACK_WEBHOOK_URL != ''
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: |
+            ${{ inputs.service_display_name }} Deployment: ${{ job.status }}
+            Environment: ${{ inputs.environment }}
+            ${{ inputs.version != 'unknown' && format('Version: {0}{1}', inputs.has_tag == 'true' && 'v' || '', inputs.version) || '' }} ${{ inputs.is_release == 'true' && '🎉' || '' }}
+            Branch: ${{ inputs.branch }}
+            Commit: ${{ inputs.commit_sha }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
