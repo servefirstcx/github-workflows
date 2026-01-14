@@ -11,79 +11,199 @@ on:
         description: "Display name for the service"
         required: false
         type: string
-      environment:
-        description: "Environment (staging or production)"
-        required: true
-        type: string
-      branch:
-        description: "Branch to deploy"
-        required: true
-        type: string
       aws_region:
         description: "AWS region"
         required: false
         type: string
         default: "eu-west-2"
-      ecr_repository:
-        description: "ECR repository name"
-        required: true
-        type: string
-      ecs_service:
-        description: "ECS service name"
-        required: true
-        type: string
-      ecs_cluster:
-        description: "ECS cluster name"
-        required: true
-        type: string
-      version:
-        description: "Version from package.json"
+      main_branch:
+        description: "Main/production branch name"
         required: false
         type: string
-        default: "unknown"
-      is_release:
-        description: "Whether this is a release deployment"
+        default: "main"
+      staging_branch:
+        description: "Staging branch name"
         required: false
-        type: boolean
-        default: false
-      has_tag:
-        description: "Whether a version tag exists"
-        required: false
-        type: boolean
-        default: false
-      commit_sha:
-        description: "Git commit SHA"
-        required: true
         type: string
-    secrets:
-      AWS_ROLE_TO_ASSUME:
-        description: "AWS IAM role ARN to assume for deployment"
-        required: true
-      SLACK_WEBHOOK_URL:
-        description: "Slack webhook URL for notifications"
+        default: "stage"
+      environment:
+        description: "Environment override (for workflow_dispatch) - optional"
         required: false
+        type: string
+      branch:
+        description: "Branch override (for workflow_dispatch) - optional"
+        required: false
+        type: string
 
 permissions:
   id-token: write
   contents: read
 
 jobs:
-  build-and-deploy:
-    name: Build and Deploy to ${{ inputs.environment }}
+  setup:
+    name: Determine Environment and Configuration
     runs-on: ubuntu-latest
-    environment: ${{ inputs.environment }}
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      branch: ${{ steps.set-env.outputs.branch }}
+      aws_region: ${{ steps.set-env.outputs.aws_region }}
+      ecr_repository: ${{ steps.set-env.outputs.ecr_repository }}
+      ecs_service: ${{ steps.set-env.outputs.ecs_service }}
+      ecs_cluster: ${{ steps.set-env.outputs.ecs_cluster }}
+      version: ${{ steps.version-check.outputs.version }}
+      is_release: ${{ steps.version-check.outputs.is_release }}
+      has_tag: ${{ steps.version-check.outputs.has_tag }}
+      aws_role_to_assume: ${{ steps.set-env.outputs.aws_role_to_assume }}
+      slack_webhook_url: ${{ steps.set-env.outputs.slack_webhook_url }}
+
+    steps:
+      - name: Set environment variables
+        id: set-env
+        run: |
+          # Determine environment and branch based on trigger
+          if [[ -n "${{ inputs.environment }}" ]]; then
+            # Manual workflow_dispatch with environment specified
+            ENV="${{ inputs.environment }}"
+            if [[ -n "${{ inputs.branch }}" ]]; then
+              BRANCH="${{ inputs.branch }}"
+            else
+              BRANCH="${{ github.ref_name }}"
+            fi
+          elif [[ "${{ github.ref }}" == "refs/heads/${{ inputs.main_branch }}" ]]; then
+            ENV="production"
+            BRANCH="${{ inputs.main_branch }}"
+          elif [[ "${{ github.ref }}" == "refs/heads/${{ inputs.staging_branch }}" ]]; then
+            ENV="staging"
+            BRANCH="${{ inputs.staging_branch }}"
+          else
+            echo "Error: Unexpected branch ${{ github.ref }}"
+            exit 1
+          fi
+
+          # Set environment-specific values
+          if [[ "$ENV" == "production" ]]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+            echo "aws_region=${{ inputs.aws_region }}" >> $GITHUB_OUTPUT
+            echo "ecr_repository=prod-${{ inputs.service_name }}-service" >> $GITHUB_OUTPUT
+            echo "ecs_service=prod-${{ inputs.service_name }}-service" >> $GITHUB_OUTPUT
+            echo "ecs_cluster=prod-fargate-cluster" >> $GITHUB_OUTPUT
+            echo "aws_role_to_assume=${{ secrets.AWS_ROLE_TO_ASSUME_PROD }}" >> $GITHUB_OUTPUT
+            echo "slack_webhook_url=${{ secrets.SLACK_WEBHOOK_URL_PROD }}" >> $GITHUB_OUTPUT
+          else
+            echo "environment=staging" >> $GITHUB_OUTPUT
+            echo "aws_region=${{ inputs.aws_region }}" >> $GITHUB_OUTPUT
+            echo "ecr_repository=stage-${{ inputs.service_name }}-service" >> $GITHUB_OUTPUT
+            echo "ecs_service=stage-${{ inputs.service_name }}-service" >> $GITHUB_OUTPUT
+            echo "ecs_cluster=stage-fargate-cluster" >> $GITHUB_OUTPUT
+            echo "aws_role_to_assume=${{ secrets.AWS_ROLE_TO_ASSUME_STAGING }}" >> $GITHUB_OUTPUT
+            echo "slack_webhook_url=${{ secrets.SLACK_WEBHOOK_URL_STAGING }}" >> $GITHUB_OUTPUT
+          fi
+
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Checkout code for version check
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.set-env.outputs.branch }}
+
+      - name: Check version and tags
+        id: version-check
+        run: |
+          # Get version from package.json if it exists
+          if [ -f "package.json" ]; then
+            VERSION=$(grep '"version"' package.json | sed -E 's/.*"version":\s*"([^"]*)".*/\1/')
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "📦 Version: $VERSION"
+            
+            # Check if this is a release (commit message contains version bump)
+            COMMIT_MESSAGE=$(git log -1 --pretty=%B)
+            if [[ "$COMMIT_MESSAGE" =~ "chore: bump version to" ]] || [[ "$COMMIT_MESSAGE" =~ "chore: release version" ]]; then
+              echo "is_release=true" >> $GITHUB_OUTPUT
+              echo "🎉 This is a release deployment"
+              
+              # For release deployments to production, wait for tag (REQUIRED)
+              if [[ "${{ steps.set-env.outputs.environment }}" == "production" ]] && [[ "${{ github.event_name }}" == "push" ]]; then
+                echo "⏳ Waiting for tag v$VERSION to be created (required for production releases)..."
+                
+                # Wait up to 30 seconds for the tag to appear (should be quick)
+                TAG_FOUND=false
+                for i in {1..10}; do
+                  git fetch --tags
+                  if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+                    echo "✅ Tag v$VERSION found!"
+                    echo "has_tag=true" >> $GITHUB_OUTPUT
+                    TAG_FOUND=true
+                    break
+                  fi
+                  echo "Waiting for tag... ($i/10)"
+                  sleep 3
+                done
+                
+                # For production releases, tag is REQUIRED
+                if [ "$TAG_FOUND" = false ]; then
+                  echo "❌ ERROR: Tag v$VERSION was not created after 30 seconds!"
+                  echo "This is a release deployment to production, but the tagging workflow appears to have failed."
+                  echo "Please check the tag-release workflow logs and ensure it completed successfully."
+                  echo ""
+                  echo "Possible issues:"
+                  echo "  - The PR might not have had the 'release' label"
+                  echo "  - The tag-release workflow might have failed"
+                  echo "  - There might be a permissions issue"
+                  echo ""
+                  echo "Deployment cannot proceed without a proper tag for production releases."
+                  exit 1
+                fi
+              else
+                # For non-release or staging deployments, tag is optional
+                git fetch --tags
+                if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+                  echo "has_tag=true" >> $GITHUB_OUTPUT
+                  echo "📌 Tag v$VERSION exists"
+                else
+                  echo "has_tag=false" >> $GITHUB_OUTPUT
+                  echo "📌 No tag for v$VERSION (OK for staging/non-release)"
+                fi
+              fi
+            else
+              # Not a release deployment - tag is optional
+              echo "is_release=false" >> $GITHUB_OUTPUT
+              echo "📦 Regular deployment"
+              
+              # Check if a tag exists anyway
+              git fetch --tags
+              if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+                echo "has_tag=true" >> $GITHUB_OUTPUT
+                echo "📌 Tag v$VERSION exists"
+              else
+                echo "has_tag=false" >> $GITHUB_OUTPUT
+                echo "📌 No tag for v$VERSION"
+              fi
+            fi
+          else
+            echo "version=unknown" >> $GITHUB_OUTPUT
+            echo "is_release=false" >> $GITHUB_OUTPUT
+            echo "has_tag=false" >> $GITHUB_OUTPUT
+            echo "⚠️ No package.json found, version unknown"
+          fi
+
+  build-and-deploy:
+    name: Build and Deploy to ${{ needs.setup.outputs.environment }}
+    needs: setup
+    runs-on: ubuntu-latest
+    environment: ${{ needs.setup.outputs.environment }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.branch }}
+          ref: ${{ needs.setup.outputs.branch }}
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          aws-region: ${{ inputs.aws_region }}
+          role-to-assume: ${{ needs.setup.outputs.aws_role_to_assume }}
+          aws-region: ${{ needs.setup.outputs.aws_region }}
 
       - name: Login to Amazon ECR
         id: login-ecr
@@ -99,9 +219,9 @@ jobs:
           context: .
           push: true
           tags: |
-            ${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr_repository }}:latest
-            ${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr_repository }}:${{ inputs.commit_sha }}
-            ${{ inputs.version != 'unknown' && format('{0}/{1}:{2}', steps.login-ecr.outputs.registry, inputs.ecr_repository, inputs.version) || '' }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ needs.setup.outputs.ecr_repository }}:latest
+            ${{ steps.login-ecr.outputs.registry }}/${{ needs.setup.outputs.ecr_repository }}:${{ github.sha }}
+            ${{ needs.setup.outputs.version != 'unknown' && format('{0}/{1}:{2}', steps.login-ecr.outputs.registry, needs.setup.outputs.ecr_repository, needs.setup.outputs.version) || '' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/arm64
@@ -111,9 +231,9 @@ jobs:
         id: task-def
         run: |
           TASK_DEF=$(aws ecs describe-services \
-            --cluster ${{ inputs.ecs_cluster }} \
-            --services ${{ inputs.ecs_service }} \
-            --region ${{ inputs.aws_region }} \
+            --cluster ${{ needs.setup.outputs.ecs_cluster }} \
+            --services ${{ needs.setup.outputs.ecs_service }} \
+            --region ${{ needs.setup.outputs.aws_region }} \
             --query 'services[0].taskDefinition' \
             --output text)
           echo "task-definition=$TASK_DEF" >> $GITHUB_OUTPUT
@@ -125,95 +245,95 @@ jobs:
           # Get the current task definition JSON
           TASK_DEF_JSON=$(aws ecs describe-task-definition \
             --task-definition ${{ steps.task-def.outputs.task-definition }} \
-            --region ${{ inputs.aws_region }} \
+            --region ${{ needs.setup.outputs.aws_region }} \
             --query 'taskDefinition' \
             --output json)
-          
+
           # Extract the image from the current task definition
           CURRENT_IMAGE=$(echo "$TASK_DEF_JSON" | jq -r '.containerDefinitions[0].image')
           echo "Current image: $CURRENT_IMAGE"
-          
+
           # Build the new image tag (use commit SHA)
           IMAGE_REPO=$(echo "$CURRENT_IMAGE" | sed 's/:.*//')
-          NEW_IMAGE_TAG="${{ inputs.commit_sha }}"
+          NEW_IMAGE_TAG="${{ github.sha }}"
           NEW_IMAGE="$IMAGE_REPO:$NEW_IMAGE_TAG"
           echo "New image: $NEW_IMAGE"
-          
+
           # Remove fields that can't be included in register-task-definition
           TASK_DEF_JSON=$(echo "$TASK_DEF_JSON" | jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
-          
+
           # Update the image in the task definition
           TASK_DEF_JSON=$(echo "$TASK_DEF_JSON" | jq --arg IMAGE "$NEW_IMAGE" '.containerDefinitions[0].image = $IMAGE')
-          
+
           # Register the new task definition
           NEW_TASK_DEF=$(aws ecs register-task-definition \
             --cli-input-json "$TASK_DEF_JSON" \
-            --region ${{ inputs.aws_region }} \
+            --region ${{ needs.setup.outputs.aws_region }} \
             --query 'taskDefinition.taskDefinitionArn' \
             --output text)
-          
+
           echo "task-definition=$NEW_TASK_DEF" >> $GITHUB_OUTPUT
           echo "✅ Registered new task definition: $NEW_TASK_DEF"
 
       - name: Update ECS service
         run: |
           aws ecs update-service \
-            --cluster ${{ inputs.ecs_cluster }} \
-            --service ${{ inputs.ecs_service }} \
+            --cluster ${{ needs.setup.outputs.ecs_cluster }} \
+            --service ${{ needs.setup.outputs.ecs_service }} \
             --task-definition ${{ steps.register-task-def.outputs.task-definition }} \
-            --region ${{ inputs.aws_region }}
+            --region ${{ needs.setup.outputs.aws_region }}
 
       - name: Wait for service stability
         run: |
           aws ecs wait services-stable \
-            --cluster ${{ inputs.ecs_cluster }} \
-            --services ${{ inputs.ecs_service }} \
-            --region ${{ inputs.aws_region }}
+            --cluster ${{ needs.setup.outputs.ecs_cluster }} \
+            --services ${{ needs.setup.outputs.ecs_service }} \
+            --region ${{ needs.setup.outputs.aws_region }}
 
       - name: Create deployment summary
         if: always()
         run: |
           echo "## 🚀 ${{ inputs.service_display_name }} Deployment Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Environment: ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "### Environment: ${{ needs.setup.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- **Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
-          if [[ "${{ inputs.version }}" != "unknown" ]]; then
-            if [[ "${{ inputs.has_tag }}" == "true" ]]; then
-              echo "- **Version:** v${{ inputs.version }} 🏷️" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ needs.setup.outputs.version }}" != "unknown" ]]; then
+            if [[ "${{ needs.setup.outputs.has_tag }}" == "true" ]]; then
+              echo "- **Version:** v${{ needs.setup.outputs.version }} 🏷️" >> $GITHUB_STEP_SUMMARY
             else
-              echo "- **Version:** ${{ inputs.version }}" >> $GITHUB_STEP_SUMMARY
+              echo "- **Version:** ${{ needs.setup.outputs.version }}" >> $GITHUB_STEP_SUMMARY
             fi
-            if [[ "${{ inputs.is_release }}" == "true" ]]; then
+            if [[ "${{ needs.setup.outputs.is_release }}" == "true" ]]; then
               echo "- **Type:** 🎉 Release Deployment" >> $GITHUB_STEP_SUMMARY
             else
               echo "- **Type:** Regular Deployment" >> $GITHUB_STEP_SUMMARY
             fi
           fi
-          echo "- **Branch:** ${{ inputs.branch }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Commit:** ${{ inputs.commit_sha }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **ECR Repository:** ${{ inputs.ecr_repository }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **ECS Service:** ${{ inputs.ecs_service }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **ECS Cluster:** ${{ inputs.ecs_cluster }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch:** ${{ needs.setup.outputs.branch }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **ECR Repository:** ${{ needs.setup.outputs.ecr_repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **ECS Service:** ${{ needs.setup.outputs.ecs_service }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **ECS Cluster:** ${{ needs.setup.outputs.ecs_cluster }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Task Definition:** ${{ steps.register-task-def.outputs.task-definition }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **AWS Region:** ${{ inputs.aws_region }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **AWS Region:** ${{ needs.setup.outputs.aws_region }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [[ "${{ job.status }}" == "success" ]]; then
-            echo "✅ **${{ inputs.environment }} deployment completed successfully!**" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **${{ needs.setup.outputs.environment }} deployment completed successfully!**" >> $GITHUB_STEP_SUMMARY
           else
-            echo "❌ **${{ inputs.environment }} deployment failed!**" >> $GITHUB_STEP_SUMMARY
+            echo "❌ **${{ needs.setup.outputs.environment }} deployment failed!**" >> $GITHUB_STEP_SUMMARY
           fi
 
       - name: Send deployment notification
-        if: always() && secrets.SLACK_WEBHOOK_URL != ''
+        if: always() && needs.setup.outputs.slack_webhook_url != ''
         uses: 8398a7/action-slack@v3
         with:
           status: ${{ job.status }}
           text: |
             ${{ inputs.service_display_name }} Deployment: ${{ job.status }}
-            Environment: ${{ inputs.environment }}
-            ${{ inputs.version != 'unknown' && format('Version: {0}{1}', inputs.has_tag == 'true' && 'v' || '', inputs.version) || '' }} ${{ inputs.is_release == 'true' && '🎉' || '' }}
-            Branch: ${{ inputs.branch }}
-            Commit: ${{ inputs.commit_sha }}
+            Environment: ${{ needs.setup.outputs.environment }}
+            ${{ needs.setup.outputs.version != 'unknown' && format('Version: {0}{1}', needs.setup.outputs.has_tag == 'true' && 'v' || '', needs.setup.outputs.version) || '' }} ${{ needs.setup.outputs.is_release == 'true' && '🎉' || '' }}
+            Branch: ${{ needs.setup.outputs.branch }}
+            Commit: ${{ github.sha }}
         env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_URL: ${{ needs.setup.outputs.slack_webhook_url }}

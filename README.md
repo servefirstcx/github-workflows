@@ -23,6 +23,7 @@ Creates a hotfix PR from `main` with a version bump (default: patch) and labels 
 ### 5. ECS Deployment Workflow (`deploy-ecs.yml`)
 
 Deploys Docker containers to AWS ECS with proper task definition management. This workflow:
+
 - Builds and pushes Docker images to ECR with commit SHA tags
 - Creates a new task definition revision for each deployment (enables rollbacks)
 - Updates the ECS service to use the new task definition
@@ -129,8 +130,8 @@ on:
         type: string
 
 env:
-  SERVICE_NAME: pdf  # Change for your service
-  SERVICE_DISPLAY_NAME: PDF Service  # Change for your service
+  SERVICE_NAME: pdf # Change for your service
+  SERVICE_DISPLAY_NAME: PDF Service # Change for your service
 
 jobs:
   setup:
@@ -172,6 +173,7 @@ jobs:
 ```
 
 **Key Features:**
+
 - ✅ Creates a new task definition revision for each deployment
 - ✅ Uses commit SHA for image tagging (not `:latest`)
 - ✅ Enables easy rollbacks to previous revisions
@@ -179,6 +181,7 @@ jobs:
 - ✅ Optional Slack notifications
 
 **Required Secrets:**
+
 - `AWS_ROLE_TO_ASSUME_PROD`: AWS IAM role ARN for production deployments
 - `AWS_ROLE_TO_ASSUME_STAGING`: AWS IAM role ARN for staging deployments
 - `SLACK_WEBHOOK_URL_PROD`: (Optional) Slack webhook for production notifications
