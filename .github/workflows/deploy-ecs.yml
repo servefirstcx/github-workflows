@@ -53,9 +53,6 @@ jobs:
       version: ${{ steps.version-check.outputs.version }}
       is_release: ${{ steps.version-check.outputs.is_release }}
       has_tag: ${{ steps.version-check.outputs.has_tag }}
-      aws_role_to_assume: ${{ steps.set-env.outputs.aws_role_to_assume }}
-      slack_webhook_url: ${{ steps.set-env.outputs.slack_webhook_url }}
-
     steps:
       - name: Set environment variables
         id: set-env
@@ -87,16 +84,12 @@ jobs:
             echo "ecr_repository=prod-${{ inputs.service_name }}-service" >> $GITHUB_OUTPUT
             echo "ecs_service=prod-${{ inputs.service_name }}-service" >> $GITHUB_OUTPUT
             echo "ecs_cluster=prod-fargate-cluster" >> $GITHUB_OUTPUT
-            echo "aws_role_to_assume=${{ secrets.AWS_ROLE_TO_ASSUME_PROD }}" >> $GITHUB_OUTPUT
-            echo "slack_webhook_url=${{ secrets.SLACK_WEBHOOK_URL_PROD }}" >> $GITHUB_OUTPUT
           else
             echo "environment=staging" >> $GITHUB_OUTPUT
             echo "aws_region=${{ inputs.aws_region }}" >> $GITHUB_OUTPUT
             echo "ecr_repository=stage-${{ inputs.service_name }}-service" >> $GITHUB_OUTPUT
             echo "ecs_service=stage-${{ inputs.service_name }}-service" >> $GITHUB_OUTPUT
             echo "ecs_cluster=stage-fargate-cluster" >> $GITHUB_OUTPUT
-            echo "aws_role_to_assume=${{ secrets.AWS_ROLE_TO_ASSUME_STAGING }}" >> $GITHUB_OUTPUT
-            echo "slack_webhook_url=${{ secrets.SLACK_WEBHOOK_URL_STAGING }}" >> $GITHUB_OUTPUT
           fi
 
           echo "branch=$BRANCH" >> $GITHUB_OUTPUT
@@ -202,7 +195,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ needs.setup.outputs.aws_role_to_assume }}
+          role-to-assume: ${{ needs.setup.outputs.environment == 'production' && secrets.AWS_ROLE_TO_ASSUME_PROD || secrets.AWS_ROLE_TO_ASSUME_STAGING }}
           aws-region: ${{ needs.setup.outputs.aws_region }}
 
       - name: Login to Amazon ECR
@@ -325,7 +318,7 @@ jobs:
           fi
 
       - name: Send deployment notification
-        if: always() && needs.setup.outputs.slack_webhook_url != ''
+        if: always()
         uses: 8398a7/action-slack@v3
         with:
           status: ${{ job.status }}
@@ -336,4 +329,4 @@ jobs:
             Branch: ${{ needs.setup.outputs.branch }}
             Commit: ${{ github.sha }}
         env:
-          SLACK_WEBHOOK_URL: ${{ needs.setup.outputs.slack_webhook_url }}
+          SLACK_WEBHOOK_URL: ${{ needs.setup.outputs.environment == 'production' && secrets.SLACK_WEBHOOK_URL_PROD || secrets.SLACK_WEBHOOK_URL_STAGING }}
