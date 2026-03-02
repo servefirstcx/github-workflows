@@ -1,0 +1,83 @@
+name: Reusable Test Workflow
+
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        type: string
+        default: "22"
+        description: Node.js version
+      test_command:
+        type: string
+        default: ""
+        description: Override test command (empty = auto-detect)
+      working_directory:
+        type: string
+        default: "."
+        description: Working directory
+      install_command:
+        type: string
+        default: ""
+        description: Override install command (empty = auto npm ci)
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: 'npm'
+          cache-dependency-path: ${{ inputs.working_directory }}/package-lock.json
+
+      - name: Detect tests
+        id: detect-tests
+        run: |
+          if [ -f "package.json" ]; then
+            TEST_SCRIPT=$(node -p "try { require('./package.json').scripts?.test || '' } catch(e) { '' }")
+            if [ -n "$TEST_SCRIPT" ] && [ "$TEST_SCRIPT" != "echo \"Error: no test specified\" && exit 1" ]; then
+              echo "has_tests=true" >> $GITHUB_OUTPUT
+              echo "Test script detected: $TEST_SCRIPT"
+            else
+              echo "has_tests=false" >> $GITHUB_OUTPUT
+              echo "No valid test script found"
+            fi
+          else
+            echo "has_tests=false" >> $GITHUB_OUTPUT
+            echo "No package.json found"
+          fi
+        working-directory: ${{ inputs.working_directory }}
+
+      - name: Install dependencies
+        if: steps.detect-tests.outputs.has_tests == 'true'
+        run: |
+          if [ -n "${{ inputs.install_command }}" ]; then
+            ${{ inputs.install_command }}
+          else
+            npm ci
+          fi
+        working-directory: ${{ inputs.working_directory }}
+
+      - name: Run tests
+        if: steps.detect-tests.outputs.has_tests == 'true'
+        run: |
+          if [ -n "${{ inputs.test_command }}" ]; then
+            ${{ inputs.test_command }}
+          else
+            npm test
+          fi
+        working-directory: ${{ inputs.working_directory }}
+
+      - name: No tests found
+        if: steps.detect-tests.outputs.has_tests != 'true'
+        run: echo "No test script found, skipping"
