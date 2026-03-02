@@ -61,21 +61,25 @@ jobs:
       - name: Install dependencies
         if: steps.detect-tests.outputs.has_tests == 'true'
         run: |
-          if [ -n "${{ inputs.install_command }}" ]; then
-            ${{ inputs.install_command }}
+          if [ -n "$INSTALL_CMD" ]; then
+            eval "$INSTALL_CMD"
           else
             npm ci
           fi
+        env:
+          INSTALL_CMD: ${{ inputs.install_command }}
         working-directory: ${{ inputs.working_directory }}
 
       - name: Run tests
         if: steps.detect-tests.outputs.has_tests == 'true'
         run: |
-          if [ -n "${{ inputs.test_command }}" ]; then
-            ${{ inputs.test_command }}
+          if [ -n "$TEST_CMD" ]; then
+            eval "$TEST_CMD"
           else
             npm test
           fi
+        env:
+          TEST_CMD: ${{ inputs.test_command }}
         working-directory: ${{ inputs.working_directory }}
 
       - name: No tests found
