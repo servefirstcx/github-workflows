@@ -84,8 +84,6 @@ jobs:
       environment: ${{ steps.set-env.outputs.environment }}
       branch: ${{ steps.set-env.outputs.branch }}
       aws_region: ${{ steps.set-env.outputs.aws_region }}
-      s3_bucket: ${{ steps.set-env.outputs.s3_bucket }}
-      cf_distribution_id: ${{ steps.set-env.outputs.cf_distribution_id }}
       version: ${{ steps.version-check.outputs.version }}
       is_release: ${{ steps.version-check.outputs.is_release }}
       has_tag: ${{ steps.version-check.outputs.has_tag }}
@@ -115,10 +113,6 @@ jobs:
           echo "environment=$ENV" >> $GITHUB_OUTPUT
           echo "branch=$BRANCH" >> $GITHUB_OUTPUT
           echo "aws_region=${{ inputs.aws_region }}" >> $GITHUB_OUTPUT
-
-          # S3 bucket and CloudFront distribution come from secrets
-          echo "s3_bucket=${{ secrets.S3_BUCKET_NAME }}" >> $GITHUB_OUTPUT
-          echo "cf_distribution_id=${{ secrets.CF_DISTRIBUTION_ID }}" >> $GITHUB_OUTPUT
 
       - name: Checkout code for version check
         uses: actions/checkout@v4
@@ -208,9 +202,11 @@ jobs:
 
       - name: Set build environment variables
         if: ${{ secrets.BUILD_ENV_VARS != '' }}
+        env:
+          BUILD_ENV_VARS: ${{ secrets.BUILD_ENV_VARS }}
         run: |
           # Parse BUILD_ENV_VARS secret (KEY=value, newline-separated)
-          echo "${{ secrets.BUILD_ENV_VARS }}" | while IFS= read -r line; do
+          echo "$BUILD_ENV_VARS" | while IFS= read -r line; do
             if [[ -n "$line" ]]; then
               echo "$line" >> $GITHUB_ENV
             fi
@@ -227,8 +223,8 @@ jobs:
 
       - name: Deploy to S3
         run: |
-          echo "🚀 Syncing ${{ inputs.build_output_dir }}/ to s3://${{ needs.setup.outputs.s3_bucket }}/"
-          aws s3 sync ./${{ inputs.build_output_dir }} s3://${{ needs.setup.outputs.s3_bucket }}/ --delete
+          echo "🚀 Syncing ${{ inputs.build_output_dir }}/ to s3://${{ secrets.S3_BUCKET_NAME }}/"
+          aws s3 sync ./${{ inputs.build_output_dir }} s3://${{ secrets.S3_BUCKET_NAME }}/ --delete
 
       - name: Set cache headers on index.html
         run: |
@@ -237,13 +233,13 @@ jobs:
             --cache-control "max-age=0, no-cache, no-store, must-revalidate" \
             --content-type "text/html" \
             ./${{ inputs.build_output_dir }}/index.html \
-            s3://${{ needs.setup.outputs.s3_bucket }}/index.html
+            s3://${{ secrets.S3_BUCKET_NAME }}/index.html
 
       - name: Invalidate CloudFront cache
         run: |
-          echo "🔄 Invalidating CloudFront distribution ${{ needs.setup.outputs.cf_distribution_id }}"
+          echo "🔄 Invalidating CloudFront distribution ${{ secrets.CF_DISTRIBUTION_ID }}"
           INVALIDATION_ID=$(aws cloudfront create-invalidation \
-            --distribution-id ${{ needs.setup.outputs.cf_distribution_id }} \
+            --distribution-id ${{ secrets.CF_DISTRIBUTION_ID }} \
             --paths "/*" \
             --query 'Invalidation.Id' \
             --output text)
@@ -276,8 +272,8 @@ jobs:
           fi
           echo "- **Branch:** ${{ needs.setup.outputs.branch }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **S3 Bucket:** ${{ needs.setup.outputs.s3_bucket }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **CloudFront:** ${{ needs.setup.outputs.cf_distribution_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **S3 Bucket:** ${{ secrets.S3_BUCKET_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **CloudFront:** ${{ secrets.CF_DISTRIBUTION_ID }}" >> $GITHUB_STEP_SUMMARY
           echo "- **AWS Region:** ${{ needs.setup.outputs.aws_region }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [[ "${{ job.status }}" == "success" ]]; then
