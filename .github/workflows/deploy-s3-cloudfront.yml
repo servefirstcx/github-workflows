@@ -1,0 +1,297 @@
+name: Reusable S3+CloudFront Deployment Workflow
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: "App name (e.g., 'admin-app')"
+        required: true
+        type: string
+      app_display_name:
+        description: "Display name for the app"
+        required: false
+        type: string
+      aws_region:
+        description: "AWS region"
+        required: false
+        type: string
+        default: "eu-west-2"
+      node_version:
+        description: "Node.js version"
+        required: false
+        type: string
+        default: "22"
+      build_command:
+        description: "Build command"
+        required: false
+        type: string
+        default: "npm run build"
+      build_output_dir:
+        description: "Build output directory (Vite: dist, CRA: build)"
+        required: false
+        type: string
+        default: "dist"
+      main_branch:
+        description: "Main/production branch name"
+        required: false
+        type: string
+        default: "main"
+      staging_branch:
+        description: "Staging branch name"
+        required: false
+        type: string
+        default: "stage"
+      environment:
+        description: "Environment override (for workflow_dispatch) - optional"
+        required: false
+        type: string
+      branch:
+        description: "Branch override (for workflow_dispatch) - optional"
+        required: false
+        type: string
+    secrets:
+      S3_BUCKET_NAME:
+        description: "S3 bucket name (per-environment)"
+        required: true
+      CF_DISTRIBUTION_ID:
+        description: "CloudFront distribution ID (per-environment)"
+        required: true
+      BUILD_ENV_VARS:
+        description: "Environment-specific build-time env vars (KEY=value, newline-separated)"
+        required: false
+      AWS_ROLE_TO_ASSUME_PROD:
+        description: "AWS IAM role ARN for production"
+        required: false
+      AWS_ROLE_TO_ASSUME_STAGING:
+        description: "AWS IAM role ARN for staging"
+        required: false
+      SLACK_WEBHOOK_URL_PROD:
+        description: "Slack webhook for production notifications"
+        required: false
+      SLACK_WEBHOOK_URL_STAGING:
+        description: "Slack webhook for staging notifications"
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  setup:
+    name: Determine Environment
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      branch: ${{ steps.set-env.outputs.branch }}
+      aws_region: ${{ steps.set-env.outputs.aws_region }}
+      version: ${{ steps.version-check.outputs.version }}
+      is_release: ${{ steps.version-check.outputs.is_release }}
+      has_tag: ${{ steps.version-check.outputs.has_tag }}
+    steps:
+      - name: Set environment variables
+        id: set-env
+        run: |
+          # Determine environment and branch based on trigger
+          if [[ -n "${{ inputs.environment }}" ]]; then
+            ENV="${{ inputs.environment }}"
+            if [[ -n "${{ inputs.branch }}" ]]; then
+              BRANCH="${{ inputs.branch }}"
+            else
+              BRANCH="${{ github.ref_name }}"
+            fi
+          elif [[ "${{ github.ref }}" == "refs/heads/${{ inputs.main_branch }}" ]]; then
+            ENV="production"
+            BRANCH="${{ inputs.main_branch }}"
+          elif [[ "${{ github.ref }}" == "refs/heads/${{ inputs.staging_branch }}" ]]; then
+            ENV="staging"
+            BRANCH="${{ inputs.staging_branch }}"
+          else
+            echo "Error: Unexpected branch ${{ github.ref }}"
+            exit 1
+          fi
+
+          echo "environment=$ENV" >> $GITHUB_OUTPUT
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "aws_region=${{ inputs.aws_region }}" >> $GITHUB_OUTPUT
+
+      - name: Checkout code for version check
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.set-env.outputs.branch }}
+
+      - name: Check version and tags
+        id: version-check
+        run: |
+          # Get version from package.json if it exists
+          if [ -f "package.json" ]; then
+            VERSION=$(grep '"version"' package.json | sed -E 's/.*"version":\s*"([^"]*)".*/\1/')
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "📦 Version: $VERSION"
+
+            # Check if this is a release (commit message contains version bump)
+            COMMIT_MESSAGE=$(git log -1 --pretty=%B)
+            if [[ "$COMMIT_MESSAGE" =~ "chore: bump version to" ]] || [[ "$COMMIT_MESSAGE" =~ "chore: release version" ]]; then
+              echo "is_release=true" >> $GITHUB_OUTPUT
+              echo "🎉 This is a release deployment"
+
+              # For release deployments to production, wait for tag (REQUIRED)
+              if [[ "${{ steps.set-env.outputs.environment }}" == "production" ]] && [[ "${{ github.event_name }}" == "push" ]]; then
+                echo "⏳ Waiting for tag v$VERSION..."
+                TAG_FOUND=false
+                for i in {1..10}; do
+                  git fetch --tags
+                  if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+                    echo "✅ Tag v$VERSION found!"
+                    echo "has_tag=true" >> $GITHUB_OUTPUT
+                    TAG_FOUND=true
+                    break
+                  fi
+                  echo "Waiting for tag... ($i/10)"
+                  sleep 3
+                done
+
+                if [ "$TAG_FOUND" = false ]; then
+                  echo "❌ ERROR: Tag v$VERSION was not created after 30 seconds!"
+                  echo "Deployment cannot proceed without a proper tag for production releases."
+                  exit 1
+                fi
+              else
+                git fetch --tags
+                if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+                  echo "has_tag=true" >> $GITHUB_OUTPUT
+                else
+                  echo "has_tag=false" >> $GITHUB_OUTPUT
+                fi
+              fi
+            else
+              echo "is_release=false" >> $GITHUB_OUTPUT
+              git fetch --tags
+              if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+                echo "has_tag=true" >> $GITHUB_OUTPUT
+              else
+                echo "has_tag=false" >> $GITHUB_OUTPUT
+              fi
+            fi
+          else
+            echo "version=unknown" >> $GITHUB_OUTPUT
+            echo "is_release=false" >> $GITHUB_OUTPUT
+            echo "has_tag=false" >> $GITHUB_OUTPUT
+          fi
+
+  build-and-deploy:
+    name: Build and Deploy to ${{ needs.setup.outputs.environment }}
+    needs: setup
+    runs-on: ubuntu-latest
+    environment: ${{ needs.setup.outputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.branch }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Set build environment variables
+        if: ${{ secrets.BUILD_ENV_VARS != '' }}
+        env:
+          BUILD_ENV_VARS: ${{ secrets.BUILD_ENV_VARS }}
+        run: |
+          # Parse BUILD_ENV_VARS secret (KEY=value, newline-separated)
+          echo "$BUILD_ENV_VARS" | while IFS= read -r line; do
+            if [[ -n "$line" ]]; then
+              echo "$line" >> $GITHUB_ENV
+            fi
+          done
+
+      - name: Build application
+        run: ${{ inputs.build_command }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ needs.setup.outputs.environment == 'production' && secrets.AWS_ROLE_TO_ASSUME_PROD || secrets.AWS_ROLE_TO_ASSUME_STAGING }}
+          aws-region: ${{ needs.setup.outputs.aws_region }}
+
+      - name: Deploy to S3
+        run: |
+          echo "🚀 Syncing ${{ inputs.build_output_dir }}/ to s3://${{ secrets.S3_BUCKET_NAME }}/"
+          aws s3 sync ./${{ inputs.build_output_dir }} s3://${{ secrets.S3_BUCKET_NAME }}/ --delete
+
+      - name: Set cache headers on index.html
+        run: |
+          echo "📄 Setting no-cache headers on index.html"
+          aws s3 cp \
+            --cache-control "max-age=0, no-cache, no-store, must-revalidate" \
+            --content-type "text/html" \
+            ./${{ inputs.build_output_dir }}/index.html \
+            s3://${{ secrets.S3_BUCKET_NAME }}/index.html
+
+      - name: Invalidate CloudFront cache
+        run: |
+          echo "🔄 Invalidating CloudFront distribution ${{ secrets.CF_DISTRIBUTION_ID }}"
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CF_DISTRIBUTION_ID }} \
+            --paths "/*" \
+            --query 'Invalidation.Id' \
+            --output text)
+          echo "✅ Invalidation created: $INVALIDATION_ID"
+
+      - name: Create deployment summary
+        if: always()
+        run: |
+          DISPLAY_NAME="${{ inputs.app_display_name }}"
+          if [[ -z "$DISPLAY_NAME" ]]; then
+            DISPLAY_NAME="${{ inputs.app_name }}"
+          fi
+
+          echo "## 🚀 $DISPLAY_NAME Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Environment: ${{ needs.setup.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ needs.setup.outputs.version }}" != "unknown" ]]; then
+            if [[ "${{ needs.setup.outputs.has_tag }}" == "true" ]]; then
+              echo "- **Version:** v${{ needs.setup.outputs.version }} 🏷️" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- **Version:** ${{ needs.setup.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+            fi
+            if [[ "${{ needs.setup.outputs.is_release }}" == "true" ]]; then
+              echo "- **Type:** 🎉 Release Deployment" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- **Type:** Regular Deployment" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          echo "- **Branch:** ${{ needs.setup.outputs.branch }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **S3 Bucket:** ${{ secrets.S3_BUCKET_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **CloudFront:** ${{ secrets.CF_DISTRIBUTION_ID }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **AWS Region:** ${{ needs.setup.outputs.aws_region }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ job.status }}" == "success" ]]; then
+            echo "✅ **${{ needs.setup.outputs.environment }} deployment completed successfully!**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **${{ needs.setup.outputs.environment }} deployment failed!**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Send deployment notification
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: |
+            ${{ inputs.app_display_name || inputs.app_name }} Deployment: ${{ job.status }}
+            Environment: ${{ needs.setup.outputs.environment }}
+            ${{ needs.setup.outputs.version != 'unknown' && format('Version: {0}{1}', needs.setup.outputs.has_tag == 'true' && 'v' || '', needs.setup.outputs.version) || '' }} ${{ needs.setup.outputs.is_release == 'true' && '🎉' || '' }}
+            Branch: ${{ needs.setup.outputs.branch }}
+            Commit: ${{ github.sha }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ needs.setup.outputs.environment == 'production' && secrets.SLACK_WEBHOOK_URL_PROD || secrets.SLACK_WEBHOOK_URL_STAGING }}
