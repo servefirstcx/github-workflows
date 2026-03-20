@@ -201,7 +201,6 @@ jobs:
         run: npm ci
 
       - name: Set build environment variables
-        if: ${{ secrets.BUILD_ENV_VARS != '' }}
         env:
           BUILD_ENV_VARS: ${{ secrets.BUILD_ENV_VARS }}
         run: |
