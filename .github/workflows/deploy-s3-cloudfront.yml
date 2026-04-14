@@ -52,10 +52,10 @@ on:
     secrets:
       S3_BUCKET_NAME:
         description: "S3 bucket name (per-environment)"
-        required: true
+        required: false
       CF_DISTRIBUTION_ID:
         description: "CloudFront distribution ID (per-environment)"
-        required: true
+        required: false
       BUILD_ENV_VARS:
         description: "Environment-specific build-time env vars (KEY=value, newline-separated)"
         required: false
