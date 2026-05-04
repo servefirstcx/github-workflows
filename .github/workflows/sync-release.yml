@@ -97,7 +97,7 @@ jobs:
             echo "ℹ️ Could not create PR - likely already exists or branches are up to date"
             # Check if PR already exists
             EXISTING_PR=$(gh pr list --base "${{ inputs.staging_branch }}" --head "${{ inputs.main_branch }}" --json number --jq '.[0].number' || echo "")
-            if [ -n "$EXISTING_PR" ]; then
+            if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
               echo "✅ Found existing PR #$EXISTING_PR"
               echo "PR_NUMBER=$EXISTING_PR" >> $GITHUB_OUTPUT
             else
@@ -115,15 +115,34 @@ jobs:
         id: merge-pr
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          # Only attempt --admin merge when RELEASE_TOKEN (admin PAT) is available.
+          # GITHUB_TOKEN lacks admin bypass capability and would silently fail.
+          MERGE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
+          if [ -z "$MERGE_TOKEN" ]; then
+            echo "⚠️ RELEASE_TOKEN not set — skipping auto-merge, PR will need manual merge"
+            echo "merged=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           echo "🔀 Merging sync PR #${{ steps.create-pr.outputs.PR_NUMBER }}..."
 
-          if gh pr merge ${{ steps.create-pr.outputs.PR_NUMBER }} --merge --admin 2>&1; then
-            echo "✅ Sync PR merged automatically"
+          # Retry up to 5 times with backoff — PR may not be mergeable immediately after creation
+          MERGED=false
+          for i in 1 2 3 4 5; do
+            if GH_TOKEN="$MERGE_TOKEN" gh pr merge ${{ steps.create-pr.outputs.PR_NUMBER }} --merge --admin 2>&1; then
+              echo "✅ Sync PR merged automatically (attempt $i)"
+              MERGED=true
+              break
+            fi
+            echo "⏳ Attempt $i failed, retrying in ${i}0s..."
+            sleep $((i * 10))
+          done
+
+          if [ "$MERGED" = "true" ]; then
             echo "merged=true" >> $GITHUB_OUTPUT
           else
-            echo "⚠️ Auto-merge failed — PR will need manual merge"
+            echo "⚠️ Auto-merge failed after 5 attempts — PR will need manual merge"
             echo "merged=false" >> $GITHUB_OUTPUT
           fi
 
