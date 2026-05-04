@@ -13,6 +13,10 @@ on:
         required: false
         type: string
         default: "main"
+    secrets:
+      RELEASE_TOKEN:
+        description: "PAT with repo+workflow scopes for creating and auto-merging the sync PR"
+        required: false
 
 permissions:
   contents: write
@@ -59,7 +63,7 @@ jobs:
       - name: Create Pull Request
         id: create-pr
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           # Create PR body with proper formatting
           cat > pr_body.md << 'EOF'
@@ -93,7 +97,7 @@ jobs:
             echo "ℹ️ Could not create PR - likely already exists or branches are up to date"
             # Check if PR already exists
             EXISTING_PR=$(gh pr list --base "${{ inputs.staging_branch }}" --head "${{ inputs.main_branch }}" --json number --jq '.[0].number' || echo "")
-            if [ -n "$EXISTING_PR" ]; then
+            if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
               echo "✅ Found existing PR #$EXISTING_PR"
               echo "PR_NUMBER=$EXISTING_PR" >> $GITHUB_OUTPUT
             else
@@ -106,22 +110,40 @@ jobs:
             echo "PR_NUMBER=$PR_NUMBER" >> $GITHUB_OUTPUT
           fi
 
-      - name: Enable auto-merge
+      - name: Merge sync PR
         if: steps.create-pr.outputs.PR_NUMBER
-        id: auto-merge
+        id: merge-pr
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Only attempt --admin merge when RELEASE_TOKEN (admin PAT) is available.
+          # GITHUB_TOKEN lacks admin bypass capability and would silently fail.
+          MERGE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
-          echo "🔍 Attempting to enable auto-merge for PR #${{ steps.create-pr.outputs.PR_NUMBER }}..."
+          if [ -z "$MERGE_TOKEN" ]; then
+            echo "⚠️ RELEASE_TOKEN not set — skipping auto-merge, PR will need manual merge"
+            echo "merged=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
 
-          # Try to enable auto-merge (regular merge to preserve release history)
-          if gh pr merge ${{ steps.create-pr.outputs.PR_NUMBER }} --auto --merge 2>&1; then
-            echo "✅ Auto-merge enabled successfully"
-            echo "auto_merge_enabled=true" >> $GITHUB_OUTPUT
+          echo "🔀 Merging sync PR #${{ steps.create-pr.outputs.PR_NUMBER }}..."
+
+          # Retry up to 5 times with backoff — PR may not be mergeable immediately after creation
+          MERGED=false
+          for i in 1 2 3 4 5; do
+            if GH_TOKEN="$MERGE_TOKEN" gh pr merge ${{ steps.create-pr.outputs.PR_NUMBER }} --merge --admin 2>&1; then
+              echo "✅ Sync PR merged automatically (attempt $i)"
+              MERGED=true
+              break
+            fi
+            echo "⏳ Attempt $i failed, retrying in ${i}0s..."
+            sleep $((i * 10))
+          done
+
+          if [ "$MERGED" = "true" ]; then
+            echo "merged=true" >> $GITHUB_OUTPUT
           else
-            echo "⚠️ Could not enable auto-merge (this is okay - might need manual review)"
-            echo "auto_merge_enabled=false" >> $GITHUB_OUTPUT
+            echo "⚠️ Auto-merge failed after 5 attempts — PR will need manual merge"
+            echo "merged=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Add summary
@@ -136,8 +158,8 @@ jobs:
             echo "[View Pull Request](https://github.com/${{ github.repository }}/pull/${{ steps.create-pr.outputs.PR_NUMBER }})" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             
-            if [ "${{ steps.auto-merge.outputs.auto_merge_enabled }}" = "true" ]; then
-              echo "✅ **Auto-merge enabled** - PR will merge automatically once checks pass" >> $GITHUB_STEP_SUMMARY
+            if [ "${{ steps.merge-pr.outputs.merged }}" = "true" ]; then
+              echo "✅ **Merged automatically** - Sync PR has been merged" >> $GITHUB_STEP_SUMMARY
             else
               echo "⚠️ **Manual merge required** - Please review and merge the PR" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
