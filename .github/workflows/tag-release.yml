@@ -147,7 +147,6 @@ jobs:
             View deployment status in the [Actions tab](https://github.com/${{ github.repository }}/actions)
           draft: false
           prerelease: false
-          generate_release_notes: true
 
       - name: Add summary
         if: steps.check_label.outputs.has_release_label == 'true'
