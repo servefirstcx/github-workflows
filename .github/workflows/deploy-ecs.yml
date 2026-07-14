@@ -26,6 +26,11 @@ on:
         required: false
         type: string
         default: "stage"
+      dev_branch:
+        description: "Dev branch name"
+        required: false
+        type: string
+        default: "dev"
       environment:
         description: "Environment override (for workflow_dispatch) - optional"
         required: false
@@ -72,6 +77,9 @@ jobs:
           elif [[ "${{ github.ref }}" == "refs/heads/${{ inputs.staging_branch }}" ]]; then
             ENV="staging"
             BRANCH="${{ inputs.staging_branch }}"
+          elif [[ "${{ github.ref }}" == "refs/heads/${{ inputs.dev_branch }}" ]]; then
+            ENV="dev"
+            BRANCH="${{ inputs.dev_branch }}"
           else
             echo "Error: Unexpected branch ${{ github.ref }}"
             exit 1
@@ -84,6 +92,12 @@ jobs:
             echo "ecr_repository=prod-${{ inputs.service_name }}-service" >> $GITHUB_OUTPUT
             echo "ecs_service=prod-${{ inputs.service_name }}-service" >> $GITHUB_OUTPUT
             echo "ecs_cluster=prod-fargate-cluster" >> $GITHUB_OUTPUT
+          elif [[ "$ENV" == "dev" ]]; then
+            echo "environment=dev" >> $GITHUB_OUTPUT
+            echo "aws_region=${{ inputs.aws_region }}" >> $GITHUB_OUTPUT
+            echo "ecr_repository=dev-${{ inputs.service_name }}-service" >> $GITHUB_OUTPUT
+            echo "ecs_service=dev-${{ inputs.service_name }}-service" >> $GITHUB_OUTPUT
+            echo "ecs_cluster=dev-fargate-cluster" >> $GITHUB_OUTPUT
           else
             echo "environment=staging" >> $GITHUB_OUTPUT
             echo "aws_region=${{ inputs.aws_region }}" >> $GITHUB_OUTPUT
@@ -195,7 +209,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ needs.setup.outputs.environment == 'production' && secrets.AWS_ROLE_TO_ASSUME_PROD || secrets.AWS_ROLE_TO_ASSUME_STAGING }}
+          role-to-assume: ${{ needs.setup.outputs.environment == 'production' && secrets.AWS_ROLE_TO_ASSUME_PROD || needs.setup.outputs.environment == 'dev' && secrets.AWS_ROLE_TO_ASSUME_DEV || secrets.AWS_ROLE_TO_ASSUME_STAGING }}
           aws-region: ${{ needs.setup.outputs.aws_region }}
 
       - name: Login to Amazon ECR
@@ -332,4 +346,4 @@ jobs:
             Branch: ${{ needs.setup.outputs.branch }}
             Commit: ${{ github.sha }}
         env:
-          SLACK_WEBHOOK_URL: ${{ needs.setup.outputs.environment == 'production' && secrets.SLACK_WEBHOOK_URL_PROD || secrets.SLACK_WEBHOOK_URL_STAGING }}
+          SLACK_WEBHOOK_URL: ${{ needs.setup.outputs.environment == 'production' && secrets.SLACK_WEBHOOK_URL_PROD || needs.setup.outputs.environment == 'dev' && secrets.SLACK_WEBHOOK_URL_DEV || secrets.SLACK_WEBHOOK_URL_STAGING }}

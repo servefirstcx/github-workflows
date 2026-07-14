@@ -122,6 +122,7 @@ on:
         required: true
         type: choice
         options:
+          - dev
           - staging
           - production
       branch:
