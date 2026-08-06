@@ -348,4 +348,4 @@ jobs:
             Commit: ${{ github.sha }}
         env:
           # Gate each secret on environment name; empty secrets are falsy and must not fall through.
-          SLACK_WEBHOOK_URL: ${{ needs.setup.outputs.environment == 'production' && secrets.SLACK_WEBHOOK_URL_PROD || needs.setup.outputs.environment == 'dev' && secrets.SLACK_WEBHOOK_URL_DEV || needs.setup.outputs.environment == 'staging' && secrets.SLACK_WEBHOOK_URL_STAGING }}
+          SLACK_WEBHOOK_URL: ${{ needs.setup.outputs.environment == 'production' && secrets.SLACK_WEBHOOK_URL_PROD || needs.setup.outputs.environment == 'dev' && secrets.SLACK_WEBHOOK_URL_STAGING || needs.setup.outputs.environment == 'staging' && secrets.SLACK_WEBHOOK_URL_STAGING }}
