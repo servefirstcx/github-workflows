@@ -209,7 +209,8 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ needs.setup.outputs.environment == 'production' && secrets.AWS_ROLE_TO_ASSUME_PROD || needs.setup.outputs.environment == 'dev' && secrets.AWS_ROLE_TO_ASSUME_DEV || secrets.AWS_ROLE_TO_ASSUME_STAGING }}
+          # Gate each secret on environment name; empty secrets are falsy and must not fall through.
+          role-to-assume: ${{ needs.setup.outputs.environment == 'production' && secrets.AWS_ROLE_TO_ASSUME_PROD || needs.setup.outputs.environment == 'dev' && secrets.AWS_ROLE_TO_ASSUME_DEV || needs.setup.outputs.environment == 'staging' && secrets.AWS_ROLE_TO_ASSUME_STAGING }}
           aws-region: ${{ needs.setup.outputs.aws_region }}
 
       - name: Login to Amazon ECR
@@ -346,4 +347,5 @@ jobs:
             Branch: ${{ needs.setup.outputs.branch }}
             Commit: ${{ github.sha }}
         env:
-          SLACK_WEBHOOK_URL: ${{ needs.setup.outputs.environment == 'production' && secrets.SLACK_WEBHOOK_URL_PROD || needs.setup.outputs.environment == 'dev' && secrets.SLACK_WEBHOOK_URL_DEV || secrets.SLACK_WEBHOOK_URL_STAGING }}
+          # Gate each secret on environment name; empty secrets are falsy and must not fall through.
+          SLACK_WEBHOOK_URL: ${{ needs.setup.outputs.environment == 'production' && secrets.SLACK_WEBHOOK_URL_PROD || needs.setup.outputs.environment == 'dev' && secrets.SLACK_WEBHOOK_URL_DEV || needs.setup.outputs.environment == 'staging' && secrets.SLACK_WEBHOOK_URL_STAGING }}
