@@ -41,6 +41,11 @@ on:
         required: false
         type: string
         default: "stage"
+      dev_branch:
+        description: "Dev branch name"
+        required: false
+        type: string
+        default: "dev"
       environment:
         description: "Environment override (for workflow_dispatch) - optional"
         required: false
@@ -64,6 +69,9 @@ on:
         required: false
       AWS_ROLE_TO_ASSUME_STAGING:
         description: "AWS IAM role ARN for staging"
+        required: false
+      AWS_ROLE_TO_ASSUME_DEV:
+        description: "AWS IAM role ARN for dev"
         required: false
       SLACK_WEBHOOK_URL_PROD:
         description: "Slack webhook for production notifications"
@@ -105,6 +113,9 @@ jobs:
           elif [[ "${{ github.ref }}" == "refs/heads/${{ inputs.staging_branch }}" ]]; then
             ENV="staging"
             BRANCH="${{ inputs.staging_branch }}"
+          elif [[ "${{ github.ref }}" == "refs/heads/${{ inputs.dev_branch }}" ]]; then
+            ENV="dev"
+            BRANCH="${{ inputs.dev_branch }}"
           else
             echo "Error: Unexpected branch ${{ github.ref }}"
             exit 1
@@ -217,7 +228,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ needs.setup.outputs.environment == 'production' && secrets.AWS_ROLE_TO_ASSUME_PROD || secrets.AWS_ROLE_TO_ASSUME_STAGING }}
+          role-to-assume: ${{ needs.setup.outputs.environment == 'production' && secrets.AWS_ROLE_TO_ASSUME_PROD || needs.setup.outputs.environment == 'dev' && (secrets.AWS_ROLE_TO_ASSUME_DEV || secrets.AWS_ROLE_TO_ASSUME_STAGING) || secrets.AWS_ROLE_TO_ASSUME_STAGING }}
           aws-region: ${{ needs.setup.outputs.aws_region }}
 
       - name: Deploy to S3
