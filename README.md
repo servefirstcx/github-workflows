@@ -20,7 +20,14 @@ Syncs releases back from main to stage.
 
 Creates a hotfix PR from `main` with a version bump (default: patch) and labels it as a release so your tagging workflow runs on merge. After tagging, your sync workflow can merge `main` back to `stage`.
 
-### 5. ECS Deployment Workflow (`deploy-ecs.yml`)
+### 5. S3+CloudFront Deployment Workflow (`deploy-s3-cloudfront.yml`)
+
+Deploys static frontend apps to S3 + CloudFront. Supports **dev**, **staging**, and **production** environments:
+- Push to `dev` branch → deploys to dev (uses `AWS_ROLE_TO_ASSUME_DEV` or falls back to `AWS_ROLE_TO_ASSUME_STAGING`)
+- Push to `stage` branch → deploys to staging (uses `AWS_ROLE_TO_ASSUME_STAGING`)
+- Push to `main` branch → deploys to production (uses `AWS_ROLE_TO_ASSUME_PROD`)
+
+### 6. ECS Deployment Workflow (`deploy-ecs.yml`)
 
 Deploys Docker containers to AWS ECS with proper task definition management. This workflow:
 
