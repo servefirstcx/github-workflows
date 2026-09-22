@@ -40,6 +40,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: read
 
 jobs:
   tag-release:
@@ -67,7 +68,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ inputs.main_branch }}
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
           # Use PAT if provided, otherwise use default token
           token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
 
@@ -121,32 +122,14 @@ jobs:
             echo "   To enable workflow triggering, pass a PAT as RELEASE_TOKEN secret"
           fi
 
-      - name: Create GitHub Release
-        if: steps.check_label.outputs.has_release_label == 'true' && steps.check_tag.outputs.exists == 'false'
-        uses: softprops/action-gh-release@v1
+      - name: Create or recover GitHub Release with reviewed notes
+        if: steps.check_label.outputs.has_release_label == 'true'
+        uses: servefirstcx/github-workflows/.github/actions/publish-release@main
         with:
-          tag_name: ${{ inputs.tag_prefix }}${{ steps.get_version.outputs.version }}
-          name: Release ${{ inputs.tag_prefix }}${{ steps.get_version.outputs.version }}
-          body: |
-            ## 🚀 Release ${{ inputs.tag_prefix }}${{ steps.get_version.outputs.version }}
-
-            ### Changes
-            This release was created from PR #${{ github.event.pull_request.number }}: ${{ github.event.pull_request.title }}
-
-            ### Deployment
-            - ✅ Version bumped to ${{ steps.get_version.outputs.version }}
-            - ✅ Tagged as ${{ inputs.tag_prefix }}${{ steps.get_version.outputs.version }}
-            - 🚀 Production deployment triggered automatically
-
-            ### Pull Request
-            - **PR:** #${{ github.event.pull_request.number }}
-            - **Merged by:** @${{ github.event.pull_request.merged_by.login }}
-            - **Merged at:** ${{ github.event.pull_request.merged_at }}
-
-            ---
-            View deployment status in the [Actions tab](https://github.com/${{ github.repository }}/actions)
-          draft: false
-          prerelease: false
+          version: ${{ steps.get_version.outputs.version }}
+          tag-prefix: ${{ inputs.tag_prefix }}
+          main-branch: ${{ inputs.main_branch }}
+          release-label: ${{ inputs.release_label }}
 
       - name: Add summary
         if: steps.check_label.outputs.has_release_label == 'true'

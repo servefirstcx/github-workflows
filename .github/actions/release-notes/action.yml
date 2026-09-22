@@ -1,0 +1,76 @@
+name: Release notes
+description: Collect exact release changes and optionally summarize using GitHub Models and Jira
+inputs:
+  base-sha:
+    description: Pinned production commit
+    required: true
+  head-sha:
+    description: Pinned release head
+    required: true
+  main-branch:
+    description: Production branch
+    default: main
+  staging-branch:
+    description: Development branch
+    default: stage
+  github-token:
+    description: GitHub repository read token (PR write when refreshing)
+    default: ${{ github.token }}
+  models-token:
+    description: Optional GitHub token with Models read permission
+    required: false
+  ai-model:
+    description: GitHub Models model ID
+    default: openai/gpt-4.1-mini
+  jira-base-url:
+    description: Optional Jira site
+    default: https://servefirst.atlassian.net
+  jira-email:
+    description: Optional read-only Jira service account email
+    required: false
+  jira-api-token:
+    description: Optional read-only Jira API token
+    required: false
+  mode:
+    description: generate or refresh (post a non-destructive review suggestion)
+    default: generate
+  pr-number:
+    description: Existing release PR number for refresh mode
+    required: false
+outputs:
+  notes-file:
+    description: Markdown notes file
+    value: ${{ steps.generate.outputs.notes-file }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+    - name: Generate release notes
+      id: generate
+      shell: bash
+      env:
+        BASE_SHA: ${{ inputs.base-sha }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+        MAIN_BRANCH: ${{ inputs.main-branch }}
+        STAGING_BRANCH: ${{ inputs.staging-branch }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        MODELS_TOKEN: ${{ inputs.models-token }}
+        AI_MODEL: ${{ inputs.ai-model }}
+        JIRA_BASE_URL: ${{ inputs.jira-base-url }}
+        JIRA_EMAIL: ${{ inputs.jira-email }}
+        JIRA_API_TOKEN: ${{ inputs.jira-api-token }}
+        NOTES_FILE: ${{ runner.temp }}/sf-release-notes.md
+      run: |
+        node "$GITHUB_ACTION_PATH/../../../scripts/generate-release-notes.mjs"
+        printf 'notes-file=%s\n' "$NOTES_FILE" >> "$GITHUB_OUTPUT"
+    - name: Post refreshed notes for review
+      if: inputs.mode == 'refresh'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+        NOTES_FILE: ${{ steps.generate.outputs.notes-file }}
+      run: node "$GITHUB_ACTION_PATH/../../../scripts/manage-release-pr.mjs"

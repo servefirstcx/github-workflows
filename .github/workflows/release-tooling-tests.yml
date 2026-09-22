@@ -1,0 +1,29 @@
+name: Release tooling tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --test tests/*.test.mjs
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Install workflow linter
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: Lint release workflows
+        run: >-
+          "$(go env GOPATH)/bin/actionlint" -shellcheck=
+          .github/workflows/release.yml
+          .github/workflows/tag-release.yml
+          .github/workflows/refresh-release-notes.yml
+          .github/workflows/release-tooling-tests.yml

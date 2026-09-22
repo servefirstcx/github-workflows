@@ -1,0 +1,33 @@
+name: Publish release notes
+description: Publish the reviewed PR notes for the exact merged and tagged commit
+inputs:
+  version:
+    description: Release version
+    required: true
+  github-token:
+    description: Contents write and pull requests read token
+    default: ${{ github.token }}
+  tag-prefix:
+    description: Release tag prefix
+    default: v
+  main-branch:
+    description: Production branch
+    default: main
+  release-label:
+    description: Release PR label
+    default: release
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+    - name: Publish saved notes
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        VERSION: ${{ inputs.version }}
+        TAG_PREFIX: ${{ inputs.tag-prefix }}
+        MAIN_BRANCH: ${{ inputs.main-branch }}
+        RELEASE_LABEL: ${{ inputs.release-label }}
+      run: node "$GITHUB_ACTION_PATH/../../../scripts/publish-release.mjs"

@@ -6,7 +6,7 @@ This repository contains reusable GitHub Actions workflows for ServeFirst reposi
 
 ### 1. Release Workflow (`release.yml`)
 
-Creates a release PR with version bump.
+Creates a release PR with a version bump, a short summary and a complete linked PR/ticket list. Optional GitHub Models and read-only Jira context improve the wording. See [release notes setup and rollout](docs/release-notes.md) for secrets, caller examples, refresh behavior and the shared Slack notification action.
 
 ### 2. Tag Release Workflow (`tag-release.yml`)
 
