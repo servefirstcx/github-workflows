@@ -54,12 +54,20 @@ on:
         description: "Branch override (for workflow_dispatch) - optional"
         required: false
         type: string
+      invalidate_distribution_tenants:
+        description: "Also invalidate the per-tenant caches of a CloudFront multi-tenant distribution (requires CF_TENANT_DISTRIBUTION_ID)"
+        required: false
+        type: boolean
+        default: false
     secrets:
       S3_BUCKET_NAME:
         description: "S3 bucket name (per-environment)"
         required: false
       CF_DISTRIBUTION_ID:
         description: "CloudFront distribution ID (per-environment)"
+        required: false
+      CF_TENANT_DISTRIBUTION_ID:
+        description: "CloudFront multi-tenant (tenant-only) distribution ID whose tenants also serve this bucket (per-environment)"
         required: false
       BUILD_ENV_VARS:
         description: "Environment-specific build-time env vars (KEY=value, newline-separated)"
@@ -231,6 +239,30 @@ jobs:
           role-to-assume: ${{ needs.setup.outputs.environment == 'production' && secrets.AWS_ROLE_TO_ASSUME_PROD || needs.setup.outputs.environment == 'dev' && (secrets.AWS_ROLE_TO_ASSUME_DEV || secrets.AWS_ROLE_TO_ASSUME_STAGING) || secrets.AWS_ROLE_TO_ASSUME_STAGING }}
           aws-region: ${{ needs.setup.outputs.aws_region }}
 
+      - name: Preflight tenant invalidation config
+        if: ${{ inputs.invalidate_distribution_tenants }}
+        env:
+          TENANT_DISTRIBUTION_ID: ${{ secrets.CF_TENANT_DISTRIBUTION_ID }}
+        run: |
+          set -euo pipefail
+
+          # Checked BEFORE the S3 upload: a misconfigured secret or an AWS CLI
+          # without the tenant subcommand should fail the deploy while it is
+          # still a no-op, rather than after objects are already live with
+          # tenant caches left stale.
+          if [[ -z "${TENANT_DISTRIBUTION_ID}" ]]; then
+            echo "❌ invalidate_distribution_tenants is true but CF_TENANT_DISTRIBUTION_ID is not set for this environment."
+            exit 1
+          fi
+
+          if ! aws cloudfront create-invalidation-for-distribution-tenant help >/dev/null 2>&1; then
+            echo "❌ This runner's AWS CLI has no create-invalidation-for-distribution-tenant."
+            aws --version
+            exit 1
+          fi
+
+          echo "✅ Tenant invalidation preflight passed for ${TENANT_DISTRIBUTION_ID}"
+
       - name: Deploy to S3
         run: |
           echo "🚀 Syncing ${{ inputs.build_output_dir }}/ to s3://${{ secrets.S3_BUCKET_NAME }}/"
@@ -254,6 +286,73 @@ jobs:
             --query 'Invalidation.Id' \
             --output text)
           echo "✅ Invalidation created: $INVALIDATION_ID"
+
+      - name: Invalidate CloudFront tenant caches
+        if: ${{ inputs.invalidate_distribution_tenants }}
+        env:
+          TENANT_DISTRIBUTION_ID: ${{ secrets.CF_TENANT_DISTRIBUTION_ID }}
+        run: |
+          set -euo pipefail
+
+          # Config and CLI capability were already validated by the preflight
+          # step before the S3 upload; this re-check is a cheap guard only.
+          if [[ -z "${TENANT_DISTRIBUTION_ID}" ]]; then
+            echo "❌ CF_TENANT_DISTRIBUTION_ID is not set for this environment."
+            exit 1
+          fi
+
+          # Per-tenant caches are separate namespaces from the direct
+          # distribution's, so the invalidation above does not reach custom
+          # domains served by the multi-tenant distribution.
+          echo "🔎 Listing tenants of distribution ${TENANT_DISTRIBUTION_ID}"
+          # Capture to a file rather than `mapfile < <(aws ...)`: process
+          # substitution discards the aws exit status, so an API failure would
+          # look identical to "no tenants" and silently pass the deploy.
+          TENANT_LIST_FILE="$(mktemp)"
+          if ! aws cloudfront list-distribution-tenants \
+            --association-filter "DistributionId=${TENANT_DISTRIBUTION_ID}" \
+            --query 'DistributionTenantList[].Id' \
+            --output text > "${TENANT_LIST_FILE}"; then
+            echo "❌ Failed to list tenants of ${TENANT_DISTRIBUTION_ID}."
+            rm -f "${TENANT_LIST_FILE}"
+            exit 1
+          fi
+
+          TENANT_IDS=()
+          while read -r TENANT_ID; do
+            [[ -n "${TENANT_ID}" ]] && TENANT_IDS+=("${TENANT_ID}")
+          done < <(tr '\t' '\n' < "${TENANT_LIST_FILE}")
+          rm -f "${TENANT_LIST_FILE}"
+
+          if [[ ${#TENANT_IDS[@]} -eq 0 ]]; then
+            echo "ℹ️  No tenants associated with ${TENANT_DISTRIBUTION_ID}; nothing to invalidate."
+            exit 0
+          fi
+
+          echo "🔄 Invalidating ${#TENANT_IDS[@]} tenant cache(s)"
+          FAILED=()
+          for TENANT_ID in "${TENANT_IDS[@]}"; do
+            # Unique CallerReference per tenant per run.
+            BATCH="{\"Paths\":{\"Quantity\":1,\"Items\":[\"/*\"]},\"CallerReference\":\"gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${TENANT_ID}\"}"
+            if INVALIDATION_ID=$(aws cloudfront create-invalidation-for-distribution-tenant \
+              --id "${TENANT_ID}" \
+              --invalidation-batch "${BATCH}" \
+              --query 'Invalidation.Id' \
+              --output text); then
+              echo "  ✅ ${TENANT_ID} -> ${INVALIDATION_ID}"
+            else
+              echo "  ❌ ${TENANT_ID} failed"
+              FAILED+=("${TENANT_ID}")
+            fi
+            # Stay well inside the invalidation request rate quota.
+            sleep 1
+          done
+
+          if [[ ${#FAILED[@]} -gt 0 ]]; then
+            echo "❌ Tenant invalidation failed for: ${FAILED[*]}"
+            exit 1
+          fi
+          echo "✅ Tenant invalidation requests submitted (${#TENANT_IDS[@]}); edges refresh asynchronously"
 
       - name: Create deployment summary
         if: always()

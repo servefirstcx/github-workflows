@@ -37,6 +37,38 @@ Deploys Docker containers to AWS ECS with proper task definition management. Thi
 - Waits for service stability
 - Sends deployment notifications to Slack (optional)
 
+### 6. S3 + CloudFront Deployment Workflow (`deploy-s3-cloudfront.yml`)
+
+Builds a static frontend, syncs it to S3, and invalidates CloudFront.
+
+By default it invalidates a single distribution, `secrets.CF_DISTRIBUTION_ID`.
+If the same bucket is *also* served through a CloudFront multi-tenant
+(tenant-only) distribution — for example CSAT custom customer domains — those
+per-tenant caches are separate cache namespaces and are **not** cleared by that
+invalidation, so custom domains keep serving stale unhashed assets from
+`public/` until their TTL expires. Hashed bundles and `index.html` are
+unaffected (new filename / `no-store` respectively).
+
+To also clear the tenant caches, opt in:
+
+```yaml
+jobs:
+  deploy:
+    uses: servefirstcx/github-workflows/.github/workflows/deploy-s3-cloudfront.yml@main
+    with:
+      app_name: ratings
+      build_output_dir: build
+      invalidate_distribution_tenants: true
+    secrets: inherit
+```
+
+and set `CF_TENANT_DISTRIBUTION_ID` (the tenant-only *parent* distribution ID)
+in each GitHub environment. The workflow enumerates that distribution's tenants
+and issues one `create-invalidation-for-distribution-tenant` per tenant. The
+deploy role needs `cloudfront:ListDistributionTenants` and
+`cloudfront:CreateInvalidationForDistributionTenant`; see
+`terraform/github-actions-iam.tf` in `sf-terraform`.
+
 ## Usage
 
 To use these workflows in your repository, create minimal wrapper workflows that call these reusable ones.
