@@ -110,12 +110,27 @@ jobs:
           echo "🚀 New version will be: $NEW_VERSION"
 
       - name: Create release branch
+        id: release_branch
+        env:
+          NEW_VERSION: ${{ steps.new_version.outputs.version }}
+          PACKAGE_FILE: ${{ inputs.package_file }}
         run: |
-          RELEASE_BRANCH="release/${{ steps.new_version.outputs.version }}"
-          git checkout -b "$RELEASE_BRANCH"
-          echo "✅ Created branch: $RELEASE_BRANCH"
+          RELEASE_BRANCH="release/$NEW_VERSION"
+          git check-ref-format "refs/heads/$RELEASE_BRANCH"
+          if git ls-remote --exit-code --heads origin "refs/heads/$RELEASE_BRANCH"; then
+            git fetch --no-tags origin "refs/heads/$RELEASE_BRANCH"
+            git checkout --detach FETCH_HEAD
+            node -e 'const fs = require("fs"); const actual = JSON.parse(fs.readFileSync(process.env.PACKAGE_FILE, "utf8")).version; if (actual !== process.env.NEW_VERSION) throw new Error("Existing release branch version mismatch");'
+            echo "reused=true" >> "$GITHUB_OUTPUT"
+          else
+            status=$?
+            if [ "$status" -ne 2 ]; then exit "$status"; fi
+            git checkout -b "$RELEASE_BRANCH"
+            echo "reused=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Update version in package.json
+        if: steps.release_branch.outputs.reused != 'true'
         run: |
           NEW_VERSION="${{ steps.new_version.outputs.version }}"
           OLD_VERSION="${{ steps.current_version.outputs.version }}"
@@ -136,6 +151,7 @@ jobs:
           echo "✅ Updated version to $NEW_VERSION"
 
       - name: Commit version bump
+        if: steps.release_branch.outputs.reused != 'true'
         run: |
           # Add the version files
           git add ${{ inputs.package_file }}
@@ -149,8 +165,11 @@ jobs:
           echo "✅ Committed version bump"
 
       - name: Push release branch
+        if: steps.release_branch.outputs.reused != 'true'
+        env:
+          NEW_VERSION: ${{ steps.new_version.outputs.version }}
         run: |
-          git push origin "release/${{ steps.new_version.outputs.version }}"
+          git push origin "HEAD:refs/heads/release/$NEW_VERSION"
           echo "✅ Pushed release branch to remote"
 
       - name: Pin release notes source
@@ -187,27 +206,70 @@ jobs:
             const fs = require('fs');
             const { owner, repo } = context.repo;
             const version = process.env.VERSION;
-            const notes = fs.readFileSync(process.env.NOTES_FILE, 'utf8');
-            const body = `## Release v${version}\n\n${notes}\n\n### Checklist\n- [ ] Tests pass\n- [ ] Ready for production\n`;
-            if (body.length > 65000) throw new Error('Release notes exceed PR body limit');
-            const { data: pr } = await github.rest.pulls.create({
-              owner, repo, title: `🚀 Release v${version}`,
-              head: `release/${version}`, base: process.env.MAIN_BRANCH, body, draft: false,
-            });
-            const { data: saved } = await github.rest.pulls.get({owner, repo, pull_number: pr.number});
-            if (saved.body !== body) throw new Error('PR body verification failed');
-            core.setOutput('pr_number', pr.number);
-            core.setOutput('pr_url', pr.html_url);
+            const head = `release/${version}`, base = process.env.MAIN_BRANCH;
+            const sameIdentity = pr => pr.head?.ref === head && pr.base?.ref === base &&
+              pr.head?.repo?.full_name?.toLowerCase() === `${owner}/${repo}`.toLowerCase() &&
+              pr.base?.repo?.full_name?.toLowerCase() === `${owner}/${repo}`.toLowerCase();
+            const findPR = async () => {
+              const candidates = await github.paginate(github.rest.pulls.list, {
+                owner, repo, head: `${owner}:${head}`, base, state: 'all', per_page: 100,
+              });
+              const matches = candidates.filter(sameIdentity);
+              if (matches.length > 1 || matches.some(pr => pr.state !== 'open')) {
+                throw new Error('Ambiguous or closed release PR; manual resolution required');
+              }
+              return matches[0];
+            };
+            let pr = await findPR();
             for (const [name, color] of [['release', '0E8A16'], ['automated', 'EDEDED']]) {
               try { await github.rest.issues.getLabel({owner, repo, name}); }
               catch (error) {
                 if (error.status !== 404) throw error;
-                await github.rest.issues.createLabel({owner, repo, name, color});
+                try { await github.rest.issues.createLabel({owner, repo, name, color}); }
+                catch (race) {
+                  if (race.status !== 422) throw race;
+                  await github.rest.issues.getLabel({owner, repo, name});
+                }
               }
             }
+            let body;
+            if (!pr) {
+              const notes = fs.readFileSync(process.env.NOTES_FILE, 'utf8');
+              body = `## Release v${version}\n\n${notes}\n\n### Checklist\n- [ ] Tests pass\n- [ ] Ready for production\n`;
+              if (body.length > 65000) throw new Error('Release notes exceed PR body limit');
+              try {
+                ({data: pr} = await github.rest.pulls.create({
+                  owner, repo, title: `🚀 Release v${version}`, head, base, body, draft: true,
+                }));
+              } catch (error) {
+                if (error.status !== 422) throw error;
+                pr = await findPR();
+                if (!pr) throw error;
+                body = undefined; // A racing creator's reviewed body belongs to that PR.
+              }
+            }
+            const readPR = async () => {
+              const {data: saved} = await github.rest.pulls.get({owner, repo, pull_number: pr.number});
+              if (!sameIdentity(saved) || saved.state !== 'open') throw new Error('Release PR identity changed');
+              if (body !== undefined ? saved.body !== body :
+                  !saved.body?.includes('<!-- sf-release-notes:start -->') || !saved.body?.includes('<!-- sf-release-notes:end -->')) {
+                throw new Error('PR body verification failed');
+              }
+              return saved;
+            };
+            await readPR();
             await github.rest.issues.addLabels({owner, repo, issue_number: pr.number, labels: ['release', 'automated']});
-            const {data: labelled} = await github.rest.pulls.get({owner, repo, pull_number: pr.number});
+            const labelled = await readPR();
             if (!labelled.labels.some(label => label.name === 'release')) throw new Error('Release label verification failed');
+            if (labelled.draft) {
+              await github.graphql(`mutation($id: ID!) {
+                markPullRequestReadyForReview(input: {pullRequestId: $id}) { pullRequest { id } }
+              }`, {id: labelled.node_id});
+            }
+            const ready = await readPR();
+            if (ready.draft || !ready.labels.some(label => label.name === 'release')) throw new Error('Ready release PR verification failed');
+            core.setOutput('pr_number', ready.number);
+            core.setOutput('pr_url', ready.html_url);
 
       - name: Summary
         run: |
