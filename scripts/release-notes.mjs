@@ -108,6 +108,8 @@ export async function collectInventory({ cwd = process.cwd(), repository, base, 
       url: `https://github.com/${repository}/commit/${sha}`, title: message.split('\n')[0], body: message,
       tickets: ticketsFor(message, jiraBaseUrl) });
   }
+  const commitOrder = new Map(commits.map((sha, index) => [sha, index]));
+  const revertTargets = new Map();
   for (const item of items) item.status = 'included';
   for (const item of items) {
     const ownMessages = [...messages].filter(([sha]) => sha === item.sha || associations.get(sha).has(item.number)).map(([, m]) => m);
@@ -118,10 +120,23 @@ export async function collectInventory({ cwd = process.cwd(), repository, base, 
       if (match[1].toLowerCase() === repository.toLowerCase()) numbers.push(Number(match[2]));
     }
     if (!/^revert\b/i.test(item.title) && !hashes.length && !numbers.length) continue;
-    if (item.status !== 'reverted') item.status = 'revert';
+    item.status = 'revert';
+    const targets = new Set();
     for (const target of items) {
-      if (target === item) continue;
-      if (numbers.includes(target.number) || hashes.some(sha => target.sha === sha || associations.get(sha)?.has(target.number))) target.status = 'reverted';
+      // Only earlier known items can be targets: no self, forward or cyclic edges.
+      if (commitOrder.get(target.sha) >= commitOrder.get(item.sha)) continue;
+      if (numbers.includes(target.number) || hashes.some(sha => target.sha === sha || associations.get(sha)?.has(target.number))) targets.add(target);
+    }
+    revertTargets.set(item, targets);
+  }
+  // PRs may be emitted on an associated commit before their actual merge. Resolve
+  // newest first by item.sha, so an inactive revert cannot cancel its own targets.
+  const inactive = new Set();
+  for (const item of [...items].sort((a, b) => commitOrder.get(b.sha) - commitOrder.get(a.sha))) {
+    if (inactive.has(item)) { item.status = 'reverted'; continue; }
+    for (const target of revertTargets.get(item) || []) {
+      if (inactive.has(target)) inactive.delete(target);
+      else inactive.add(target);
     }
   }
   return { base, head, items };

@@ -53,9 +53,11 @@ In standalone deployment jobs, replace the old `8398a7/action-slack` step:
     webhook-url: ${{ secrets.SLACK_WEBHOOK_URL_PROD }} # select explicitly by environment
 ```
 
-Capture `deployed` outputs from the actual checkout using `git rev-parse HEAD` and the checkout's package.json. Do not substitute `github.sha`: a manual deployment can select a different ref. Where setup/build are separate jobs, resolve the ref once and pin build to that SHA. Grant the notification job `contents: read` and `pull-requests: read`; preserve its existing OIDC/deployment permissions.
+Capture `deployed` outputs from the actual checkout using `git rev-parse HEAD` and the checkout's package.json. Do not substitute `github.sha`: a manual deployment can select a different ref. Where setup/build are separate jobs, resolve the ref once and pin build to that SHA. Grant the notification job only `contents: read` and `pull-requests: read`; preserve the actual deployment job's existing OIDC/deployment permissions.
 
-API and Console currently have standalone notification steps. The shared ECS/S3 workflows are deliberately not switched automatically in this change, to avoid surprising other callers with new token permissions. They can adopt the same composite action separately.
+For a separate notification-only job, use `environment: { name: <target>, deployment: false }` to retain environment-scoped secrets without creating a misleading successful deployment record. Pass the actual setup/deployment job results through `needs`, not the notification job's own `job.status`. GitHub does not support `deployment: false` with custom deployment protection rules; check the target environments first.
+
+API and Console use separate notification jobs in the companion PRs. The shared ECS/S3 workflows are deliberately not switched automatically in this change, to avoid surprising other callers with new token permissions. They can adopt the same composite action separately.
 
 ## Editing, freshness and delivery
 

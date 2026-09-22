@@ -106,6 +106,55 @@ test('explicit reverts remain visible separately and their original PR is not cl
   assert.match(markdown, /reverted in this range; not claimed shipped/);
 });
 
+for (const associated of [false, true]) {
+  for (const depth of [1, 2, 3, 4]) {
+    test(`revert chain parity at depth ${depth} (${associated ? 'PR associations' : 'direct commits'})`, async t => {
+      const r = repository(t), shas = [r.commit('Add export')];
+      for (let i = 0; i < depth; i++) {
+        r.git('revert', '--no-edit', shas.at(-1));
+        shas.push(r.git('rev-parse', 'HEAD'));
+      }
+      const mapping = Object.fromEntries(shas.map((sha, i) => [sha, associated ? [pr(i + 1, sha, {
+        title: i ? `Revert operation ${i}` : 'Add export',
+        // The same edge is supplied by number AND git's full commit hash.
+        body: i ? `Reverts #${i}\nReverts acme/app#${i}` : '',
+      })] : []]));
+      const inventory = await notes.collectInventory({ cwd: r.cwd, repository: 'acme/app', base: r.base,
+        head: shas.at(-1), token: 'mock', fetchImpl: async url => response(mapping[new URL(url).pathname.split('/').at(-2)]) });
+      const markdown = notes.renderNotes({ ...inventory, summary: 'Changes recorded in this release range.' });
+      const shipped = markdown.split('## Included changes')[1].split('## Reverts and reverted changes')[0];
+      assert.equal(shipped.includes('Add export'), depth % 2 === 0, 'original is shipped exactly when the chain reapplies it');
+      assert.deepEqual(inventory.items.map(i => i.status), shas.map((_, i) =>
+        (depth - i) % 2 ? 'reverted' : i ? 'revert' : 'included'));
+      assert.equal(r.git('show', 'HEAD:app.txt'), depth % 2 ? r.git('show', `${r.base}:app.txt`) : r.git('show', `${shas[0]}:app.txt`));
+    });
+  }
+}
+
+test('revert activation follows merge commit order, not early PR association emission', async t => {
+  const r = repository(t), precursor = r.commit('Prepare reapply', 'prepare.txt');
+  const feature = r.commit('Add export');
+  r.git('revert', '--no-edit', feature); const undo = r.git('rev-parse', 'HEAD');
+  r.git('revert', '--no-edit', undo); const reapply = r.git('rev-parse', 'HEAD');
+  const last = pr(3, reapply, { title: 'Revert undo', body: 'Reverts #2' });
+  const mapping = { [precursor]: [last], [feature]: [pr(1, feature, { title: 'Add export' })],
+    [undo]: [pr(2, undo, { title: 'Revert export', body: 'Reverts #1' })], [reapply]: [last] };
+  const inventory = await notes.collectInventory({ cwd: r.cwd, repository: 'acme/app', base: r.base,
+    head: reapply, token: 'mock', fetchImpl: async url => response(mapping[new URL(url).pathname.split('/').at(-2)]) });
+  assert.deepEqual(inventory.items.map(i => [i.number, i.status]), [[3, 'revert'], [1, 'included'], [2, 'reverted']]);
+  const shipped = notes.renderNotes({ ...inventory, summary: 'Recorded changes.' }).split('## Included changes')[1].split('## Reverts and reverted changes')[0];
+  assert.match(shipped, /Add export/);
+});
+
+test('revert references cannot point forward or form cycles', async t => {
+  const r = repository(t), first = r.commit('Earlier operation'), second = r.commit('Later operation');
+  const mapping = { [first]: [pr(1, first, { title: 'Revert future', body: 'Reverts #2\nReverts #1' })],
+    [second]: [pr(2, second, { title: 'Revert earlier', body: 'Reverts #1' })] };
+  const inventory = await notes.collectInventory({ cwd: r.cwd, repository: 'acme/app', base: r.base,
+    head: second, token: 'mock', fetchImpl: async url => response(mapping[new URL(url).pathname.split('/').at(-2)]) });
+  assert.deepEqual(inventory.items.map(i => i.status), ['reverted', 'revert']);
+});
+
 test('optional Jira context is bounded, title/description-only, deduplicated and fail-soft', async () => {
   assert.equal(typeof notes.enrichWithJira, 'function', 'Jira context is implemented');
   const items = [{ id: 'pr:1', title: 'Fix', tickets: [{ key: 'SF-1', url: 'https://servefirst.atlassian.net/browse/SF-1' }] },
