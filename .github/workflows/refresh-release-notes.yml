@@ -1,0 +1,79 @@
+name: Refresh release PR notes
+on:
+  workflow_call:
+    inputs:
+      main_branch:
+        type: string
+        default: main
+      staging_branch:
+        type: string
+        default: stage
+      ai_model:
+        type: string
+        default: openai/gpt-4.1-mini
+      jira_base_url:
+        type: string
+        default: https://servefirst.atlassian.net
+    secrets:
+      MODELS_TOKEN:
+        required: false
+      JIRA_EMAIL:
+        required: false
+      JIRA_API_TOKEN:
+        required: false
+permissions:
+  contents: read
+  pull-requests: write
+concurrency:
+  group: release-notes-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  refresh:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.state == 'open' &&
+      github.event.pull_request.base.ref == inputs.main_branch &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (startsWith(github.event.pull_request.head.ref, 'release/') ||
+       startsWith(github.event.pull_request.head.ref, 'hotfix/'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check source has changed
+        id: current
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {data: pr} = await github.rest.pulls.get({...context.repo, pull_number: context.issue.number});
+            if (pr.head.sha !== context.payload.pull_request.head.sha) {
+              core.setOutput('refresh', 'false');
+              return;
+            }
+            const source = (pr.body || '').match(/<!-- sf-release-source:(\{[^\n]*\}) -->/);
+            let current = false;
+            try {
+              const parsed = JSON.parse(source?.[1] || '{}');
+              current = parsed.head === pr.head.sha && parsed.base === context.payload.pull_request.base.sha;
+            } catch { /* malformed metadata is repaired by regeneration */ }
+            core.setOutput('refresh', String(!current));
+      - uses: actions/checkout@v4
+        if: steps.current.outputs.refresh == 'true'
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Suggest refreshed notes without rewriting the PR
+        if: steps.current.outputs.refresh == 'true'
+        uses: servefirstcx/github-workflows/.github/actions/release-notes@main
+        with:
+          mode: refresh
+          pr-number: ${{ github.event.pull_request.number }}
+          base-sha: ${{ github.event.pull_request.base.sha }}
+          head-sha: ${{ github.event.pull_request.head.sha }}
+          main-branch: ${{ inputs.main_branch }}
+          staging-branch: ${{ inputs.staging_branch }}
+          models-token: ${{ secrets.MODELS_TOKEN }}
+          ai-model: ${{ inputs.ai_model }}
+          jira-base-url: ${{ inputs.jira_base_url }}
+          jira-email: ${{ secrets.JIRA_EMAIL }}
+          jira-api-token: ${{ secrets.JIRA_API_TOKEN }}

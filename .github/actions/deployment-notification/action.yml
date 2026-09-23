@@ -1,0 +1,42 @@
+name: Deployment notification
+description: Send verified saved release notes to Slack without commit or action metadata
+inputs:
+  status:
+    description: Actual deployment result
+    required: true
+  environment:
+    description: Deployment environment
+    required: true
+  version:
+    description: Version from the deployed checkout
+    required: false
+  deployed-sha:
+    description: Actual checked-out and deployed commit, not the workflow trigger SHA
+    required: false
+  github-token:
+    description: Repository contents and pull requests read token
+    default: ${{ github.token }}
+  webhook-url:
+    description: Optional existing Slack incoming webhook
+    required: false
+  main-branch:
+    description: Production branch
+    default: main
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+    - name: Send notification
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        DEPLOY_STATUS: ${{ inputs.status }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        VERSION: ${{ inputs.version }}
+        DEPLOYED_SHA: ${{ inputs.deployed-sha }}
+        SLACK_WEBHOOK_URL: ${{ inputs.webhook-url }}
+        MAIN_BRANCH: ${{ inputs.main-branch }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: node "$GITHUB_ACTION_PATH/../../../scripts/notify-deployment.mjs"

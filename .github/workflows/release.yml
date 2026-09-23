@@ -38,6 +38,25 @@ on:
         type: string
         default: "github-actions[bot]@users.noreply.github.com"
 
+      ai_model:
+        description: "GitHub Models model (used when MODELS_TOKEN is provided)"
+        type: string
+        default: "openai/gpt-4.1-mini"
+      jira_base_url:
+        description: "Jira site for optional ticket context"
+        type: string
+        default: "https://servefirst.atlassian.net"
+    secrets:
+      MODELS_TOKEN:
+        description: "Optional GitHub Models read token; absent means title/link fallback"
+        required: false
+      JIRA_EMAIL:
+        description: "Optional read-only Jira service account email"
+        required: false
+      JIRA_API_TOKEN:
+        description: "Optional read-only Jira API token"
+        required: false
+
 permissions:
   contents: write
   pull-requests: write
@@ -46,6 +65,7 @@ jobs:
   create-release-pr:
     name: Create Release PR
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout code
@@ -90,12 +110,27 @@ jobs:
           echo "🚀 New version will be: $NEW_VERSION"
 
       - name: Create release branch
+        id: release_branch
+        env:
+          NEW_VERSION: ${{ steps.new_version.outputs.version }}
+          PACKAGE_FILE: ${{ inputs.package_file }}
         run: |
-          RELEASE_BRANCH="release/${{ steps.new_version.outputs.version }}"
-          git checkout -b "$RELEASE_BRANCH"
-          echo "✅ Created branch: $RELEASE_BRANCH"
+          RELEASE_BRANCH="release/$NEW_VERSION"
+          git check-ref-format "refs/heads/$RELEASE_BRANCH"
+          if git ls-remote --exit-code --heads origin "refs/heads/$RELEASE_BRANCH"; then
+            git fetch --no-tags origin "refs/heads/$RELEASE_BRANCH"
+            git checkout --detach FETCH_HEAD
+            node -e 'const fs = require("fs"); const actual = JSON.parse(fs.readFileSync(process.env.PACKAGE_FILE, "utf8")).version; if (actual !== process.env.NEW_VERSION) throw new Error("Existing release branch version mismatch");'
+            echo "reused=true" >> "$GITHUB_OUTPUT"
+          else
+            status=$?
+            if [ "$status" -ne 2 ]; then exit "$status"; fi
+            git checkout -b "$RELEASE_BRANCH"
+            echo "reused=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Update version in package.json
+        if: steps.release_branch.outputs.reused != 'true'
         run: |
           NEW_VERSION="${{ steps.new_version.outputs.version }}"
           OLD_VERSION="${{ steps.current_version.outputs.version }}"
@@ -116,6 +151,7 @@ jobs:
           echo "✅ Updated version to $NEW_VERSION"
 
       - name: Commit version bump
+        if: steps.release_branch.outputs.reused != 'true'
         run: |
           # Add the version files
           git add ${{ inputs.package_file }}
@@ -129,80 +165,111 @@ jobs:
           echo "✅ Committed version bump"
 
       - name: Push release branch
+        if: steps.release_branch.outputs.reused != 'true'
+        env:
+          NEW_VERSION: ${{ steps.new_version.outputs.version }}
         run: |
-          git push origin "release/${{ steps.new_version.outputs.version }}"
+          git push origin "HEAD:refs/heads/release/$NEW_VERSION"
           echo "✅ Pushed release branch to remote"
+
+      - name: Pin release notes source
+        id: notes_source
+        env:
+          MAIN_BRANCH: ${{ inputs.main_branch }}
+        run: |
+          printf 'base=%s\n' "$(git rev-parse "refs/remotes/origin/$MAIN_BRANCH^{commit}")" >> "$GITHUB_OUTPUT"
+          printf 'head=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Collect and summarize included changes
+        id: notes
+        uses: servefirstcx/github-workflows/.github/actions/release-notes@main
+        with:
+          base-sha: ${{ steps.notes_source.outputs.base }}
+          head-sha: ${{ steps.notes_source.outputs.head }}
+          main-branch: ${{ inputs.main_branch }}
+          staging-branch: ${{ inputs.staging_branch }}
+          models-token: ${{ secrets.MODELS_TOKEN }}
+          ai-model: ${{ inputs.ai_model }}
+          jira-base-url: ${{ inputs.jira_base_url }}
+          jira-email: ${{ secrets.JIRA_EMAIL }}
+          jira-api-token: ${{ secrets.JIRA_API_TOKEN }}
 
       - name: Create Pull Request
         id: create_pr
+        uses: actions/github-script@v7
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Create PR using GitHub API
-          PR_RESPONSE=$(curl -s -X POST \
-            -H "Authorization: token $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/pulls \
-            -d '{
-              "title": "🚀 Release v${{ steps.new_version.outputs.version }}",
-              "head": "release/${{ steps.new_version.outputs.version }}",
-              "base": "${{ inputs.main_branch }}",
-              "body": "## 🚀 Release v${{ steps.new_version.outputs.version }}\n\nThis PR contains the version bump for the **${{ inputs.version_type }}** release from `${{ steps.current_version.outputs.version }}` to `${{ steps.new_version.outputs.version }}`.\n\n### Release Type\n- **Type:** ${{ inputs.version_type }}\n- **From:** v${{ steps.current_version.outputs.version }}\n- **To:** v${{ steps.new_version.outputs.version }}\n\n### What happens next?\n1. **Tests will run automatically** on this PR\n2. **Review and approve** when tests pass\n3. **Merge the PR** to trigger:\n   - Automatic tagging as v${{ steps.new_version.outputs.version }}\n   - Production deployment\n\n### Checklist\n- [ ] Tests pass\n- [ ] Ready for production\n\n---\n*This PR was automatically created by the release workflow*"
-            }')
-
-          PR_NUMBER=$(echo "$PR_RESPONSE" | grep -o '"number":[[:space:]]*[0-9]*' | head -1 | sed 's/.*:[[:space:]]*//')
-          PR_URL=$(echo "$PR_RESPONSE" | grep -o '"html_url":[[:space:]]*"[^"]*' | head -1 | cut -d'"' -f4)
-
-          if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ]; then
-            echo "❌ Failed to create PR"
-            echo "Response: $PR_RESPONSE"
-            echo ""
-            echo "Common causes:"
-            echo "  - A PR already exists from this branch"
-            echo "  - No changes between branches"
-            echo "  - Permission issues"
-            exit 1
-          fi
-
-          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
-          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
-
-          echo "✅ Created PR #$PR_NUMBER"
-          echo "📎 URL: $PR_URL"
-
-      - name: Add release label to PR
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # First, try to create the 'release' label if it doesn't exist
-          # This will fail silently if the label already exists
-          curl -s -X POST \
-            -H "Authorization: token $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/labels \
-            -d '{"name": "release", "color": "0E8A16", "description": "Release PR"}' || true
-
-          # Try to create the 'automated' label if it doesn't exist
-          curl -s -X POST \
-            -H "Authorization: token $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/labels \
-            -d '{"name": "automated", "color": "EDEDED", "description": "Automated PR"}' || true
-
-          # Now add the labels to the PR
-          LABEL_RESPONSE=$(curl -s -X POST \
-            -H "Authorization: token $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/issues/${{ steps.create_pr.outputs.pr_number }}/labels \
-            -d '{"labels": ["release", "automated"]}')
-
-          # Check if labels were added successfully
-          if echo "$LABEL_RESPONSE" | grep -q '"name":[[:space:]]*"release"'; then
-            echo "✅ Added release labels"
-          else
-            echo "⚠️ Warning: Could not add labels to PR (labels may not exist in the repository)"
-            echo "Response: $LABEL_RESPONSE"
-          fi
+          NOTES_FILE: ${{ steps.notes.outputs.notes-file }}
+          VERSION: ${{ steps.new_version.outputs.version }}
+          MAIN_BRANCH: ${{ inputs.main_branch }}
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const version = process.env.VERSION;
+            const head = `release/${version}`, base = process.env.MAIN_BRANCH;
+            const sameIdentity = pr => pr.head?.ref === head && pr.base?.ref === base &&
+              pr.head?.repo?.full_name?.toLowerCase() === `${owner}/${repo}`.toLowerCase() &&
+              pr.base?.repo?.full_name?.toLowerCase() === `${owner}/${repo}`.toLowerCase();
+            const findPR = async () => {
+              const candidates = await github.paginate(github.rest.pulls.list, {
+                owner, repo, head: `${owner}:${head}`, base, state: 'all', per_page: 100,
+              });
+              const matches = candidates.filter(sameIdentity);
+              if (matches.length > 1 || matches.some(pr => pr.state !== 'open')) {
+                throw new Error('Ambiguous or closed release PR; manual resolution required');
+              }
+              return matches[0];
+            };
+            let pr = await findPR();
+            for (const [name, color] of [['release', '0E8A16'], ['automated', 'EDEDED']]) {
+              try { await github.rest.issues.getLabel({owner, repo, name}); }
+              catch (error) {
+                if (error.status !== 404) throw error;
+                try { await github.rest.issues.createLabel({owner, repo, name, color}); }
+                catch (race) {
+                  if (race.status !== 422) throw race;
+                  await github.rest.issues.getLabel({owner, repo, name});
+                }
+              }
+            }
+            let body;
+            if (!pr) {
+              const notes = fs.readFileSync(process.env.NOTES_FILE, 'utf8');
+              body = `## Release v${version}\n\n${notes}\n\n### Checklist\n- [ ] Tests pass\n- [ ] Ready for production\n`;
+              if (body.length > 65000) throw new Error('Release notes exceed PR body limit');
+              try {
+                ({data: pr} = await github.rest.pulls.create({
+                  owner, repo, title: `🚀 Release v${version}`, head, base, body, draft: true,
+                }));
+              } catch (error) {
+                if (error.status !== 422) throw error;
+                pr = await findPR();
+                if (!pr) throw error;
+                body = undefined; // A racing creator's reviewed body belongs to that PR.
+              }
+            }
+            const readPR = async () => {
+              const {data: saved} = await github.rest.pulls.get({owner, repo, pull_number: pr.number});
+              if (!sameIdentity(saved) || saved.state !== 'open') throw new Error('Release PR identity changed');
+              if (body !== undefined ? saved.body !== body :
+                  !saved.body?.includes('<!-- sf-release-notes:start -->') || !saved.body?.includes('<!-- sf-release-notes:end -->')) {
+                throw new Error('PR body verification failed');
+              }
+              return saved;
+            };
+            await readPR();
+            await github.rest.issues.addLabels({owner, repo, issue_number: pr.number, labels: ['release', 'automated']});
+            const labelled = await readPR();
+            if (!labelled.labels.some(label => label.name === 'release')) throw new Error('Release label verification failed');
+            if (labelled.draft) {
+              await github.graphql(`mutation($id: ID!) {
+                markPullRequestReadyForReview(input: {pullRequestId: $id}) { pullRequest { id } }
+              }`, {id: labelled.node_id});
+            }
+            const ready = await readPR();
+            if (ready.draft || !ready.labels.some(label => label.name === 'release')) throw new Error('Ready release PR verification failed');
+            core.setOutput('pr_number', ready.number);
+            core.setOutput('pr_url', ready.html_url);
 
       - name: Summary
         run: |
