@@ -76,15 +76,24 @@ export async function releasedTickets(options) {
   // and every ticket on what it reverts is dropped, even if something else also
   // closes it. (A revert of a revert also drops it; mark those tickets by hand.)
   const changeKeys = sha => shippedTicketKeys({messages: [messages.get(sha)]});
-  const prKeys = pr => shippedTicketKeys({branch: pr.head?.ref, body: pr.body,
+  // The generated notes block never counts, for adding or for dropping tickets.
+  const prKeys = pr => shippedTicketKeys({branch: pr.head?.ref, body: String(pr.body || '').replace(NOTES_BLOCK, ''),
     messages: [...prsOf].filter(([, numbers]) => numbers.has(pr.number)).map(([sha]) => messages.get(sha))});
   const isRevert = text => /^revert\b/i.test(text || '');
   const dropped = new Set(), revertPrs = new Set(), revertCommits = new Set();
+  const droppedPrs = new Set();
   const dropPr = number => {
+    if (droppedPrs.has(number)) return;
+    droppedPrs.add(number);
     const pr = prs.get(number) || releases.get(number);
     if (pr) for (const key of prKeys(pr)) dropped.add(key);
-    // A reverted hotfix also takes its own direct commits with it.
-    if (releases.has(number) && number !== release.number) for (const sha of releaseShas.get(number) || []) for (const key of changeKeys(sha)) dropped.add(key);
+    // A reverted hotfix takes everything it contained with it: its direct commits and the PRs merged into it.
+    if (!releases.has(number) || number === release.number) return;
+    for (const sha of releaseShas.get(number) || []) {
+      for (const key of changeKeys(sha)) dropped.add(key);
+      for (const inner of prsOf.get(sha) || []) dropPr(inner);
+      for (const [other, shas] of releaseShas) if (other !== release.number && shas.includes(sha)) dropPr(other);
+    }
   };
   const reverting = [...prs.values(), ...releases.values()].filter(pr => isRevert(pr.title) || /^revert-/.test(pr.head?.ref || ''));
   for (const pr of reverting) {
@@ -123,7 +132,8 @@ export async function releasedTickets(options) {
 /** Previous successful production deployment. Fails closed when it can't be read. */
 async function reportingBase(api, deployedSha) {
   const deployments = [];
-  for (let page = 1; page <= 10; page++) {
+  for (let page = 1; ; page++) {
+    requireValue(page <= 10, 'Too many production deployments; cannot establish the previous one');
     let list;
     try { list = await api(`/deployments?environment=production&per_page=100&page=${page}`); }
     catch (error) {
@@ -139,8 +149,15 @@ async function reportingBase(api, deployedSha) {
   for (const deployment of deployments.slice(own + 1)) {
     if (deployment.sha === deployedSha || !SHA.test(deployment.sha || '') || !Number.isSafeInteger(deployment.id)) continue;
     // A newer deploy marks older ones "inactive"; any success means it reached production.
-    const statuses = await api(`/deployments/${deployment.id}/statuses?per_page=100`);
-    if (!Array.isArray(statuses) || !statuses.some(item => item?.state === 'success')) continue;
+    let succeeded = false;
+    for (let page = 1; !succeeded; page++) {
+      requireValue(page <= 10, 'Too many deployment statuses; cannot establish the previous production deployment');
+      const statuses = await api(`/deployments/${deployment.id}/statuses?per_page=100&page=${page}`);
+      requireValue(Array.isArray(statuses), 'Invalid deployment statuses response');
+      succeeded = statuses.some(item => item?.state === 'success');
+      if (statuses.length < 100) break;
+    }
+    if (!succeeded) continue;
     const {status} = await api(`/compare/${deployment.sha}...${deployedSha}`);
     if (status === 'ahead') return {base: deployment.sha, warnings: []};
     if (status === 'behind' || status === 'identical') return {base: null, warnings: ['Deployed version is not newer than the previous production deployment (rollback or redeploy); no tickets reported.']};

@@ -316,7 +316,7 @@ function releaseFixture({deployments = [200, [{id: 1, sha: MERGE}, {id: 2, sha: 
     'GET /pulls/7': release,
     [`GET /commits/${MERGE}/pulls?per_page=100&page=1`]: [200, rows.find(([c]) => c.sha === MERGE)?.[1] || [release]],
     'GET /deployments?environment=production&per_page=100&page=1': deployments,
-    'GET /deployments/2/statuses?per_page=100': [200, [{state: 'inactive'}, {state: 'success'}]],
+    'GET /deployments/2/statuses?per_page=100&page=1': [200, [{state: 'inactive'}, {state: 'success'}]],
     [`GET /compare/${PREV}...${MERGE}`]: {status: compare},
     [`GET /compare/${PREV}...${MERGE}?per_page=100&page=1`]: {total_commits: rows.length, commits: rows.map(([c]) => c)},
     [`GET /commits/${MERGE}`]: {sha: MERGE, parents: [{sha: GAP}, {sha: HEAD}]},
@@ -384,6 +384,37 @@ test('released tickets: reverted content commits and reverted hotfixes report no
   ];
   const result = await d.releasedTickets({...deployOptions, fetch: releaseFixture({range, extra: {'GET /pulls/7': release}}).fetch});
   assert.deepEqual(result.tickets, ['SF-93']);
+});
+
+test('released tickets: a reverted hotfix drops the PRs merged into it, and the notes block never counts', async () => {
+  const release = {...pr(), merged_at: '2026-01-02T00:00:00Z', head: {sha: HEAD, ref: 'release/1.2'}, base: {ref: 'main', repo: {full_name: 'org/repo'}}, body: ''};
+  const hotfix = repoPr(30, 'hotfix/1.1.2', {base: {ref: 'main', repo: {full_name: 'org/repo'}}, merge_commit_sha: sha(30), body: '<!-- sf-release-notes:start -->\nCloses SF-93\n<!-- sf-release-notes:end -->'});
+  const feature = repoPr(31, 'SF-71-feature', {base: {ref: 'hotfix/1.1.2', repo: {full_name: 'org/repo'}}, body: 'Closes SF-72', merge_commit_sha: sha(31)});
+  const range = [
+    [commit(sha(6001), 'feature work'), [feature, hotfix, release]],
+    [commit(sha(31), 'Merge pull request #31 from org/SF-71-feature'), [feature, hotfix, release]],
+    [commit(sha(30), 'Merge pull request #30 from org/hotfix/1.1.2'), [hotfix, release]],
+    [commit(sha(6002), 'Revert hotfix\n\nThis reverts commit ' + sha(30) + '.'), [release]],
+    [commit(sha(6003), 'tidy\n\nCloses SF-93'), [release]],
+    [commit(MERGE, 'Merge pull request #7 from org/release/1.2'), [release]],
+  ];
+  const result = await d.releasedTickets({...deployOptions, fetch: releaseFixture({range, extra: {'GET /pulls/7': release}}).fetch});
+  // SF-71/SF-72 were undone with the hotfix. SF-93 is only "closed" inside the hotfix's notes block, which never counts.
+  assert.deepEqual(result.tickets, ['SF-93']);
+});
+
+test('released tickets: deployment statuses and history are read to the end, or fail closed', async () => {
+  const statuses = Array.from({length: 100}, () => ({state: 'inactive'}));
+  const paged = releaseFixture({extra: {
+    'GET /deployments/2/statuses?per_page=100&page=1': [200, statuses],
+    'GET /deployments/2/statuses?per_page=100&page=2': [200, [{state: 'success'}]],
+  }});
+  assert.ok((await d.releasedTickets({...deployOptions, fetch: paged.fetch})).tickets.includes('SF-1'));
+  assert.ok(paged.calls.some(c => c.key === 'GET /deployments/2/statuses?per_page=100&page=2'));
+  const full = Array.from({length: 100}, (_, i) => ({id: 1000 + i, sha: sha(7000 + i)}));
+  const pages = Object.fromEntries(Array.from({length: 10}, (_, i) => [`GET /deployments?environment=production&per_page=100&page=${i + 1}`, [200, full]]));
+  for (const {id} of full) pages[`GET /deployments/${id}/statuses?per_page=100&page=1`] = [200, [{state: 'failure'}]];
+  await assert.rejects(d.releasedTickets({...deployOptions, fetch: releaseFixture({extra: pages}).fetch}), /Too many production deployments/);
 });
 
 test('Jira webhook requires current endpoint and secret, batches, and never leaks errors', async () => {
