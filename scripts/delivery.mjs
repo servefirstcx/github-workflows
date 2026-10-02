@@ -54,7 +54,8 @@ export async function releasedTickets(options) {
   const messages = new Map(commits.map(c => [c.sha, c.commit?.message || '']));
   // Internal main<->stage sync PRs only; a fork's own main branch is an ordinary PR.
   const isSync = pr => pr.head?.repo?.full_name === repository && [mainBranch, stagingBranch].includes(pr.head?.ref) && [mainBranch, stagingBranch].includes(pr.base?.ref);
-  const isRelease = pr => pr.head?.repo?.full_name === repository && /^(?:release|hotfix)\//.test(pr.head?.ref || '');
+  // Release/hotfix PRs into main. A hotfix/SF-1-x branch merged into stage is an ordinary PR.
+  const isRelease = pr => pr.head?.repo?.full_name === repository && pr.base?.ref === mainBranch && /^(?:release|hotfix)\//.test(pr.head?.ref || '');
   const prs = new Map(), prsOf = new Map(), releases = new Map([[release.number, release]]), releaseShas = new Map(), syncCommits = new Set();
   for (const sha of messages.keys()) {
     const found = new Set();
@@ -125,7 +126,7 @@ export async function releasedTickets(options) {
   // "Closes KEY" in a release/hotfix PR description, outside the generated notes block.
   for (const pr of releases.values()) {
     if (revertPrs.has(pr.number)) continue;
-    for (const key of shippedTicketKeys({body: String(pr.body || '').replace(NOTES_BLOCK, '')})) keys.add(key);
+    for (const key of shippedTicketKeys({branch: pr.head?.ref, body: String(pr.body || '').replace(NOTES_BLOCK, '')})) keys.add(key);
   }
   return {tickets: [...keys].filter(key => !dropped.has(key)).sort(), releasePr: release, warnings};
 }

@@ -429,6 +429,15 @@ test('released tickets: fork PRs from a branch named main count; notes-block "Re
   assert.deepEqual(result.tickets, ['SF-77', 'SF-93']);
 });
 
+test('released tickets: hotfix-named feature branches keep their branch ticket', async () => {
+  const release = {...pr(), merged_at: '2026-01-02T00:00:00Z', head: {sha: HEAD, ref: 'release/1.2', repo: {full_name: 'org/repo'}}, base: {ref: 'main', repo: {full_name: 'org/repo'}}, body: ''};
+  const toStage = repoPr(50, 'hotfix/SF-77-export', {body: null});
+  const toMain = repoPr(51, 'hotfix/SF-78-cells', {base: {ref: 'main', repo: {full_name: 'org/repo'}}, body: null});
+  const range = [[commit(sha(50), 'neutral'), [toStage, release]], [commit(sha(51), 'neutral'), [toMain, release]], [commit(MERGE, 'Merge pull request #7 from org/release/1.2'), [release]]];
+  const result = await d.releasedTickets({...deployOptions, fetch: releaseFixture({range, extra: {'GET /pulls/7': release}}).fetch});
+  assert.deepEqual(result.tickets, ['SF-77', 'SF-78']);
+});
+
 test('released tickets: long deployment history is fine when the previous deploy is near the top', async () => {
   const full = [{id: 1, sha: MERGE}, {id: 2, sha: PREV}, ...Array.from({length: 98}, (_, i) => ({id: 1000 + i, sha: sha(7000 + i)}))];
   const fixture = releaseFixture({deployments: [200, full]});
