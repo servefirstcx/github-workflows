@@ -113,7 +113,11 @@ export async function releasedTickets(options) {
       if (!messages.has(target)) continue;
       for (const key of changeKeys(target)) dropped.add(key);
       for (const number of prsOf.get(target)) dropPr(number);
-      for (const pr of releases.values()) if (pr.merge_commit_sha === target) dropPr(pr.number);
+      // A reverted hotfix merge, or a reverted commit inside an earlier hotfix, drops that hotfix.
+      // (Every commit is inside the release being deployed, so that one is never dropped this way.)
+      for (const pr of releases.values()) {
+        if (pr.number !== release.number && (pr.merge_commit_sha === target || releaseShas.get(pr.number)?.includes(target))) dropPr(pr.number);
+      }
     }
   }
 
