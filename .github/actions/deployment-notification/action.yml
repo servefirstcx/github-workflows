@@ -1,5 +1,5 @@
 name: Deployment notification
-description: Send verified saved release notes to Slack without commit or action metadata
+description: Send verified saved release notes to Slack, and released ticket keys to Jira, without commit or action metadata
 inputs:
   status:
     description: Actual deployment result
@@ -19,6 +19,12 @@ inputs:
   webhook-url:
     description: Optional existing Slack incoming webhook
     required: false
+  jira-webhook-url:
+    description: Optional Jira Automation incoming webhook; receives ticket keys from verified production release notes
+    required: false
+  jira-webhook-secret:
+    description: Optional secret for the Jira Automation webhook (sent as X-Automation-Webhook-Token)
+    required: false
   main-branch:
     description: Production branch
     default: main
@@ -37,6 +43,8 @@ runs:
         VERSION: ${{ inputs.version }}
         DEPLOYED_SHA: ${{ inputs.deployed-sha }}
         SLACK_WEBHOOK_URL: ${{ inputs.webhook-url }}
+        JIRA_WEBHOOK_URL: ${{ inputs.jira-webhook-url }}
+        JIRA_WEBHOOK_SECRET: ${{ inputs.jira-webhook-secret }}
         MAIN_BRANCH: ${{ inputs.main-branch }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       run: node "$GITHUB_ACTION_PATH/../../../scripts/notify-deployment.mjs"

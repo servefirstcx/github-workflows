@@ -23,6 +23,47 @@ function requireValue(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+const JIRA_WEBHOOK = /^https:\/\/(?:api-private\.atlassian\.com\/automation\/webhooks\/jira\/|automation\.atlassian\.com\/pro\/hooks\/)[A-Za-z0-9_/-]+$/;
+const JIRA_BATCH = 50;
+
+/** Ticket keys linked from the verified notes' included changes only; reverts are not claimed shipped. */
+export function releasedTickets(content = '') {
+  const keys = new Set();
+  let included = false;
+  for (const line of String(content).split('\n')) {
+    if (/^#{1,6} /.test(line)) { included = /^#{1,6} Included changes\s*$/.test(line); continue; }
+    if (!included || /\(reverted in this range/.test(line) || /\(revert\)/.test(line)) continue;
+    for (const match of line.matchAll(/\[([A-Z][A-Z0-9]+-\d+)\]\(https:\/\/[a-z0-9][a-z0-9-]*\.atlassian\.net\/browse\/([A-Z][A-Z0-9]+-\d+)\)/g)) {
+      if (match[1] === match[2]) keys.add(match[1]);
+    }
+  }
+  return [...keys].sort();
+}
+
+/**
+ * Posts released ticket keys to a Jira Automation incoming webhook whose trigger
+ * is "Issues provided in the webhook HTTP POST body". The Jira rule owns what
+ * happens next (status, fix version, comment); this side holds no Jira write credential.
+ */
+export async function sendJiraRelease({webhook, secret, tickets = [], repository, version, notesUrl, fetch: fetchImpl = globalThis.fetch}) {
+  if (!webhook) return {sent: false, skipped: true, tickets: 0};
+  requireValue(typeof webhook === 'string' && JIRA_WEBHOOK.test(webhook), 'Invalid Jira automation webhook URL');
+  requireValue(secret === undefined || secret === '' || (typeof secret === 'string' && !/[\x00-\x1f\x7f]/.test(secret)), 'Invalid Jira automation webhook secret');
+  requireValue(Array.isArray(tickets) && tickets.every(key => /^[A-Z][A-Z0-9]+-\d+$/.test(key)), 'Invalid Jira ticket keys');
+  if (!tickets.length) return {sent: false, skipped: true, tickets: 0};
+  const headers = {'Content-Type': 'application/json', ...(secret ? {'X-Automation-Webhook-Token': secret} : {})};
+  for (let index = 0; index < tickets.length; index += JIRA_BATCH) {
+    let response;
+    try {
+      response = await fetchImpl(webhook, {method: 'POST', redirect: 'error', signal: AbortSignal.timeout(15000), headers,
+        body: JSON.stringify({issues: tickets.slice(index, index + JIRA_BATCH), data: {repository, version, notesUrl: notesUrl || null}})});
+    } catch { throw new Error('Jira delivery failed (network, redirect or timeout)'); }
+    // Never log response bodies, URLs or the secret.
+    if (!response.ok) throw new Error(`Jira delivery failed (HTTP ${response.status})`);
+  }
+  return {sent: true, skipped: false, tickets: tickets.length};
+}
+
 export function createGitHub({repository, token, fetch: fetchImpl = globalThis.fetch}) {
   requireValue(/^[\w.-]+\/[\w.-]+$/.test(repository || ''), 'GITHUB_REPOSITORY must be owner/repository');
   requireValue(typeof token === 'string' && token.length > 0, 'GH_TOKEN is required');
@@ -106,7 +147,7 @@ export async function prepareDeployment(options) {
   requireValue(['success', 'failure', 'cancelled', 'skipped'].includes(status), 'Invalid DEPLOY_STATUS');
   requireValue(/^[\w.-]+\/[\w.-]+$/.test(repository || ''), 'GITHUB_REPOSITORY must be owner/repository');
   requireValue(typeof runUrl === 'string' && new RegExp(`^https://github\\.com/${repository.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/actions/runs/[0-9]+(?:/attempts/[0-9]+)?$`).test(runUrl), 'RUN_URL must be the exact repository workflow run URL');
-  let content = '', notesAvailable = false, notesUrl;
+  let content = '', notesAvailable = false, notesUrl, tickets = [];
   const warnings = [];
   if (environment === 'production' && status === 'success' && version) {
     const api = createGitHub(options);
@@ -121,13 +162,14 @@ export async function prepareDeployment(options) {
       requireValue(saved, 'Saved notes provenance is missing, malformed or stale');
       content = saved.content;
       notesAvailable = true;
+      tickets = releasedTickets(content);
       notesUrl = release ? `https://github.com/${repository}/releases/tag/${encodeURIComponent(tag)}` : `https://github.com/${repository}/pull/${pr.number}`;
     } catch {
       content = 'Release notes unavailable for this deployment.';
       warnings.push('Release notes unavailable: exact deployed provenance could not be verified.');
     }
   }
-  return {payload: buildSlackPayload({...options, content, notesUrl}), notesAvailable, warnings};
+  return {payload: buildSlackPayload({...options, content, notesUrl}), notesAvailable, notesUrl, tickets, warnings};
 }
 
 function escapeSlack(text) {

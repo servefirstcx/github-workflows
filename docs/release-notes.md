@@ -2,9 +2,11 @@
 
 ## What changes
 
-Release PRs contain a short overview, followed by the actual included PRs and linked Jira tickets. The generated section is identified by `sf-release-notes` markers. GitHub Release publication copies this reviewed section; deployment notifications reuse it. Deployment never calls an AI model or Jira.
+Release PRs contain a short overview, followed by the actual included PRs and linked Jira tickets. The generated section is identified by `sf-release-notes` markers. GitHub Release publication copies this reviewed section; deployment notifications reuse it. Deployment never calls an AI model or reads from Jira.
 
 The collector uses pinned production and release commits, not a date window or the latest stage branch. Missing AI/Jira credentials use a complete title/link fallback. Inventory collection failures are errors, not a falsely complete list. Model output cannot add/remove source items or supply links.
+
+The one Jira write is optional and happens after a verified production deploy: the deployment notification can report released ticket keys to a Jira Automation webhook (see [Marking Jira tickets as released](#marking-jira-tickets-as-released)).
 
 PR descriptions and Jira text are sent to GitHub Models only when `MODELS_TOKEN` is configured. No credentials are included in the prompt. Jira enrichment reads only ticket summary/description, not comments or attachments. Model output is a draft for review, not proof that a ticket is complete or that a deployment passed.
 
@@ -58,6 +60,33 @@ Capture `deployed` outputs from the actual checkout using `git rev-parse HEAD` a
 For a separate notification-only job, use `environment: { name: <target>, deployment: false }` to retain environment-scoped secrets without creating a misleading successful deployment record. Pass the actual setup/deployment job results through `needs`, not the notification job's own `job.status`. GitHub does not support `deployment: false` with custom deployment protection rules; check the target environments first.
 
 API and Console use separate notification jobs in the companion PRs. The shared ECS/S3 workflows are deliberately not switched automatically in this change, to avoid surprising other callers with new token permissions. They can adopt the same composite action separately.
+
+## Marking Jira tickets as released
+
+GitHub for Jira only links a production deployment to tickets it finds in roughly the first ~100 commits since the previous deployment. Weekly releases are routinely 100–300+ commits, so most shipped tickets never show as deployed. The verified release notes already list every included ticket, so the notification action can hand that exact list to Jira.
+
+On a **successful production** deploy whose notes pass the provenance checks above, the action POSTs the ticket keys from the *Included changes* section (never the reverts section or lines marked reverted) to a Jira Automation incoming webhook, in batches of 50:
+
+```json
+{"issues": ["SF-4300", "SF-4401"], "data": {"repository": "servefirstcx/sf-api", "version": "4.25.0", "notesUrl": "https://github.com/servefirstcx/sf-api/releases/tag/v4.25.0"}}
+```
+
+Nothing is sent for staging/dev, failed deploys, or unverifiable notes (a warning is logged instead). GitHub holds only the webhook URL and secret, which can do nothing except trigger that one rule. It holds no Jira user credential. What happens to the tickets is defined, and visible, in Jira.
+
+**Jira rule (SF project):**
+1. Trigger: *Incoming webhook*, "Issues provided in the webhook HTTP POST body". Copy the URL and secret.
+2. Condition: status is not *Done (In Production)*, *Done (No-code Task)* or *Closed (Archived)*.
+3. Action: transition to *Done (In Production)*.
+4. Action: comment `Released to production in {{webhookData.repository}} v{{webhookData.version}} — {{webhookData.notesUrl}}`.
+
+Store the URL and secret as Actions secrets **`JIRA_RELEASE_WEBHOOK_URL`** and **`JIRA_RELEASE_WEBHOOK_SECRET`** on the application repositories, and pass them to the notification step alongside the Slack webhook:
+
+```yaml
+    jira-webhook-url: ${{ secrets.JIRA_RELEASE_WEBHOOK_URL }}
+    jira-webhook-secret: ${{ secrets.JIRA_RELEASE_WEBHOOK_SECRET }}
+```
+
+Slack and Jira are independent: either can be configured alone, and a failure in one does not skip the other. Either failure still fails the (non-blocking) notification step so it is visible. Redeploying the same version resends the same keys, and the rule's status condition makes that a no-op. Only tickets in a verified release PR's notes are reported, so a hotfix PR whose notes were never applied reports nothing. Apply the refresh comment's notes before merging.
 
 ## Editing, freshness and delivery
 
