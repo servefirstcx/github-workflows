@@ -20,10 +20,10 @@ inputs:
     description: Optional existing Slack incoming webhook
     required: false
   jira-webhook-url:
-    description: Optional Jira Automation incoming webhook; receives ticket keys from verified production release notes
+    description: Optional Jira Automation incoming webhook (api-private.atlassian.com); receives ticket keys shipped by a successful production deploy. The job needs deployments read
     required: false
   jira-webhook-secret:
-    description: Optional secret for the Jira Automation webhook (sent as X-Automation-Webhook-Token)
+    description: Secret for the Jira Automation webhook, sent as X-Automation-Webhook-Token. Required when jira-webhook-url is set
     required: false
   main-branch:
     description: Production branch

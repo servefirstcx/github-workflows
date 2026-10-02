@@ -21,9 +21,42 @@ async function requestJSON(fetchImpl, url, options = {}, timeout = 20_000) {
   catch { throw new Error('Invalid remote JSON response'); }
 }
 
-function ticketsFor(text, jiraBaseUrl) {
-  return [...new Set(text.match(/\b[A-Z][A-Z0-9]+-\d+\b/g) || [])].sort()
-    .map(key => ({ key, url: `${jiraBaseUrl}/browse/${key}` }));
+const KEY = /^[A-Z][A-Z0-9]+-\d+$/;
+const TOKEN = /^\[?(?:https:\/\/[a-z0-9][a-z0-9-]*\.atlassian\.net\/browse\/)?([A-Za-z][A-Za-z0-9]+-\d+)\]?(?:\(https:\/\/[^\s)]+\))?[.;:)]?$/;
+
+/** Uppercase keys in a branch name, e.g. SF-4401-gridspot-image-lost or feat/SF-12-x. */
+export function branchKeys(ref = '') {
+  return String(ref).match(/(?<![A-Za-z0-9])[A-Z][A-Z0-9]+-\d+(?![0-9])/g) || [];
+}
+
+/**
+ * "Closes SF-1", "Closes: SF-1, SF-2 and SF-3", "Closes [SF-1](https://x.atlassian.net/browse/SF-1)".
+ * Only the close keyword counts, never a bare mention elsewhere.
+ */
+export function closingKeys(text = '') {
+  const keys = [];
+  for (const match of String(text).matchAll(/\bclose[sd]:?[ \t]+([^\r\n]+)/gi)) {
+    for (const part of match[1].split(/[ \t]*,[ \t]*|[ \t]+and[ \t]+|[ \t]+/i)) {
+      const token = part.match(TOKEN);
+      if (!token) break;
+      keys.push(token[1].toUpperCase());
+    }
+  }
+  return keys;
+}
+
+/**
+ * The one rule for which tickets a change ships: keys in its branch name, plus
+ * "Closes KEY" in its PR description or its commit messages. Mentions anywhere
+ * else (titles, "depends on SF-1", "follow-up to SF-2") never count.
+ */
+export function shippedTicketKeys({ branch = '', body = '', messages = [] } = {}) {
+  const keys = [...branchKeys(branch), ...closingKeys(body), ...messages.flatMap(message => closingKeys(message))];
+  return [...new Set(keys.filter(key => KEY.test(key)))].sort();
+}
+
+function ticketsFor(keys, jiraBaseUrl) {
+  return keys.map(key => ({ key, url: `${jiraBaseUrl}/browse/${key}` }));
 }
 
 // Only root package version changes count as version housekeeping. Dependency updates remain changes.
@@ -101,12 +134,19 @@ export async function collectInventory({ cwd = process.cwd(), repository, base, 
       emitted.add(number);
       const p = prs.get(number);
       items.push({ id: `pr:${number}`, kind: 'pr', number, sha: p.merge_commit_sha,
-        url: `https://github.com/${repository}/pull/${number}`, title: p.title, body: p.body || '',
-        tickets: ticketsFor(`${p.title}\n${p.body || ''}\n${p.head?.ref || ''}`, jiraBaseUrl) });
+        url: `https://github.com/${repository}/pull/${number}`, title: p.title, body: p.body || '', branch: p.head?.ref || '' });
     }
     if (!ids.size && !housekeeping.has(sha)) items.push({ id: `commit:${sha}`, kind: 'commit', sha,
-      url: `https://github.com/${repository}/commit/${sha}`, title: message.split('\n')[0], body: message,
-      tickets: ticketsFor(message, jiraBaseUrl) });
+      url: `https://github.com/${repository}/commit/${sha}`, title: message.split('\n')[0], body: message });
+  }
+  // Same rule the deployment notification re-checks against GitHub before telling Jira.
+  for (const item of items) {
+    const keys = item.kind === 'pr'
+      ? shippedTicketKeys({ branch: item.branch, body: item.body,
+        messages: [...messages].filter(([sha]) => associations.get(sha).has(item.number)).map(([, m]) => m) })
+      : shippedTicketKeys({ messages: [item.body] });
+    item.tickets = ticketsFor(keys, jiraBaseUrl);
+    delete item.branch;
   }
   const commitOrder = new Map(commits.map((sha, index) => [sha, index]));
   const revertTargets = new Map();

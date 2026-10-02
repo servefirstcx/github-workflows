@@ -1,3 +1,4 @@
+import {shippedTicketKeys} from './release-notes.mjs';
 const SHA = /^[a-f0-9]{40}$/;
 
 
@@ -23,43 +24,137 @@ function requireValue(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-const JIRA_WEBHOOK = /^https:\/\/(?:api-private\.atlassian\.com\/automation\/webhooks\/jira\/|automation\.atlassian\.com\/pro\/hooks\/)[A-Za-z0-9_/-]+$/;
+// Current incoming-webhook endpoint only. The legacy automation.atlassian.com/pro/hooks
+// endpoint was retired by Atlassian on 30 May 2025, and the new one requires the secret.
+const JIRA_WEBHOOK = /^https:\/\/api-private\.atlassian\.com\/automation\/webhooks\/jira\/a\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+$/;
 const JIRA_BATCH = 50;
+const NOTES_BLOCK = /<!-- sf-release-notes:start -->[\s\S]*?<!-- sf-release-notes:end -->/g;
+const REVERTS_COMMIT = /\bThis reverts commit ([a-f0-9]{40})\b/gi;
 
-/** Ticket keys linked from the verified notes' included changes only; reverts are not claimed shipped. */
-export function releasedTickets(content = '') {
-  const keys = new Set();
-  let included = false;
-  for (const line of String(content).split('\n')) {
-    if (/^#{1,6} /.test(line)) { included = /^#{1,6} Included changes\s*$/.test(line); continue; }
-    if (!included || /\(reverted in this range/.test(line) || /\(revert\)/.test(line)) continue;
-    for (const match of line.matchAll(/\[([A-Z][A-Z0-9]+-\d+)\]\(https:\/\/[a-z0-9][a-z0-9-]*\.atlassian\.net\/browse\/([A-Z][A-Z0-9]+-\d+)\)/g)) {
-      if (match[1] === match[2]) keys.add(match[1]);
+/**
+ * Jira tickets shipped by a verified production deploy, rebuilt from GitHub, not
+ * from the editable notes text. Range: the last successful production deployment
+ * (so a release that merged but never deployed is still reported by the next one),
+ * else the commit before the release merge. Same rule as the release notes
+ * (shippedTicketKeys): branch name or "Closes KEY". Reverts and the changes they
+ * revert inside the range are left out; when unsure, a ticket is not reported.
+ */
+export async function releasedTickets(options) {
+  const {repository, deployedSha, version, tagPrefix = 'v', mainBranch = 'main', releaseLabel = 'release'} = options;
+  const api = createGitHub(options);
+  requireValue(await resolveTag(api, tagName(version, tagPrefix)) === deployedSha, 'Tag does not match deployed SHA');
+  const release = await associatedReleasePR(api, deployedSha, mainBranch, releaseLabel);
+  requireValue(release, 'No unique merged release PR for deployed SHA');
+  const {base, warnings} = await reportingBase(api, deployedSha);
+  if (!base) return {tickets: [], releasePr: release, warnings};
+
+  const commits = await rangeCommits(api, base, deployedSha);
+  const inRange = new Map(commits.map(c => [c.sha, c.commit?.message || '']));
+  const prs = new Map(), owner = new Map(), wrappers = [release];
+  for (const [sha, message] of inRange) {
+    const number = Number(message.match(/^Merge pull request #(\d+) from /)?.[1] || message.split('\n')[0].match(/\(#(\d+)\)$/)?.[1]);
+    if (!Number.isSafeInteger(number) || number < 1 || prs.has(number) || number === release.number) continue;
+    const pr = await api(`/pulls/${number}`);
+    if (pr.merged !== true || pr.merge_commit_sha !== sha || pr.base?.repo?.full_name !== repository) continue;
+    if (/^(?:release|hotfix)\//.test(pr.head?.ref || '') || [mainBranch, 'stage'].includes(pr.head?.ref)) { wrappers.push(pr); continue; }
+    const own = [sha];
+    for (let page = 1; page <= 3; page++) { // GitHub lists at most 250 commits per PR.
+      const list = await api(`/pulls/${number}/commits?per_page=100&page=${page}`);
+      requireValue(Array.isArray(list), 'Invalid pull request commits response');
+      own.push(...list.map(c => c.sha).filter(c => inRange.has(c)));
+      if (list.length < 100) break;
+    }
+    for (const c of own) if (!owner.has(c)) owner.set(c, number);
+    prs.set(number, {pr, own: [...new Set(own)]});
+  }
+  // Reverts: the revert itself never ships a ticket, and neither does what it reverts.
+  const revertedShas = new Set(), revertedPrs = new Set();
+  for (const message of inRange.values()) for (const m of message.matchAll(REVERTS_COMMIT)) revertedShas.add(m[1].toLowerCase());
+  for (const {pr} of prs.values()) {
+    if (!/^revert\b/i.test(pr.title || '') && !/^revert-/.test(pr.head?.ref || '')) continue;
+    revertedPrs.add(pr.number);
+    for (const m of String(pr.body || '').matchAll(/\bReverts\s+(?:([\w.-]+\/[\w.-]+))?#(\d+)\b/gi)) {
+      if (!m[1] || m[1].toLowerCase() === repository.toLowerCase()) revertedPrs.add(Number(m[2]));
     }
   }
-  return [...keys].sort();
+  for (const sha of revertedShas) if (owner.has(sha) && prs.get(owner.get(sha)).pr.merge_commit_sha === sha) revertedPrs.add(owner.get(sha));
+  const keys = new Set();
+  for (const [number, {pr, own}] of prs) {
+    if (revertedPrs.has(number)) continue;
+    const messages = own.filter(c => !revertedShas.has(c) && !/^Revert\b/.test(inRange.get(c))).map(c => inRange.get(c));
+    for (const key of shippedTicketKeys({branch: pr.head?.ref, body: pr.body, messages})) keys.add(key);
+  }
+  for (const [sha, message] of inRange) {
+    if (owner.has(sha) || revertedShas.has(sha) || /^Revert\b/.test(message)) continue;
+    if (wrappers.some(w => w.merge_commit_sha === sha)) continue;
+    for (const key of shippedTicketKeys({messages: [message]})) keys.add(key);
+  }
+  // "Closes KEY" written in the release or hotfix PR description itself (outside the generated notes).
+  for (const wrapper of wrappers) for (const key of shippedTicketKeys({body: String(wrapper.body || '').replace(NOTES_BLOCK, '')})) keys.add(key);
+  return {tickets: [...keys].sort(), releasePr: release, warnings};
+}
+
+/** Last successful production deployment before this one, if GitHub can tell us. */
+async function reportingBase(api, deployedSha) {
+  const fallback = async reason => {
+    const parent = (await api(`/commits/${deployedSha}`)).parents?.[0]?.sha;
+    requireValue(SHA.test(parent || ''), 'Deployed commit has no parent');
+    return {base: parent, warnings: reason ? [reason] : []};
+  };
+  let deployments;
+  try { deployments = await api('/deployments?environment=production&per_page=30'); }
+  catch { return fallback('Could not read production deployments (grant deployments: read); reporting this release PR only.'); }
+  requireValue(Array.isArray(deployments), 'Invalid deployments response');
+  // Newest first. Start after this deploy's own record(s), so reruns and replays look further back.
+  const own = deployments.findIndex(deployment => deployment?.sha === deployedSha);
+  for (const deployment of deployments.slice(own + 1)) {
+    if (deployment.sha === deployedSha || !SHA.test(deployment.sha || '') || !Number.isSafeInteger(deployment.id)) continue;
+    // A newer deploy can mark older ones "inactive"; any success means it reached production.
+    const statuses = await api(`/deployments/${deployment.id}/statuses?per_page=100`);
+    if (!Array.isArray(statuses) || !statuses.some(item => item?.state === 'success')) continue;
+    const {status} = await api(`/compare/${deployment.sha}...${deployedSha}`);
+    if (status === 'ahead') return {base: deployment.sha, warnings: []};
+    if (status === 'behind' || status === 'identical') return {base: null, warnings: ['Deployed version is not newer than the last production deployment; no tickets reported.']};
+    return fallback('Last production deployment is not an ancestor of this one; reporting this release PR only.');
+  }
+  return fallback();
+}
+
+async function rangeCommits(api, base, head) {
+  const commits = [];
+  for (let page = 1; page <= 100; page++) {
+    const result = await api(`/compare/${base}...${head}?per_page=100&page=${page}`);
+    requireValue(Number.isSafeInteger(result.total_commits) && Array.isArray(result.commits), 'Invalid compare response');
+    commits.push(...result.commits);
+    if (commits.length >= result.total_commits || !result.commits.length) {
+      requireValue(commits.length === result.total_commits, 'Incomplete commit range');
+      return commits;
+    }
+  }
+  throw new Error('Commit range exceeded safe limit');
 }
 
 /**
  * Posts released ticket keys to a Jira Automation incoming webhook whose trigger
  * is "Issues provided in the webhook HTTP POST body". The Jira rule owns what
- * happens next (status, fix version, comment); this side holds no Jira write credential.
+ * happens next; this side holds no Jira user credential.
  */
 export async function sendJiraRelease({webhook, secret, tickets = [], repository, version, notesUrl, fetch: fetchImpl = globalThis.fetch}) {
-  if (!webhook) return {sent: false, skipped: true, tickets: 0};
   requireValue(typeof webhook === 'string' && JIRA_WEBHOOK.test(webhook), 'Invalid Jira automation webhook URL');
-  requireValue(secret === undefined || secret === '' || (typeof secret === 'string' && !/[\x00-\x1f\x7f]/.test(secret)), 'Invalid Jira automation webhook secret');
+  requireValue(typeof secret === 'string' && secret.length > 0 && !/[\x00-\x1f\x7f]/.test(secret), 'Jira automation webhook secret is required');
   requireValue(Array.isArray(tickets) && tickets.every(key => /^[A-Z][A-Z0-9]+-\d+$/.test(key)), 'Invalid Jira ticket keys');
   if (!tickets.length) return {sent: false, skipped: true, tickets: 0};
-  const headers = {'Content-Type': 'application/json', ...(secret ? {'X-Automation-Webhook-Token': secret} : {})};
+  const headers = {'Content-Type': 'application/json', 'X-Automation-Webhook-Token': secret};
+  let sent = 0;
   for (let index = 0; index < tickets.length; index += JIRA_BATCH) {
     let response;
     try {
       response = await fetchImpl(webhook, {method: 'POST', redirect: 'error', signal: AbortSignal.timeout(15000), headers,
         body: JSON.stringify({issues: tickets.slice(index, index + JIRA_BATCH), data: {repository, version, notesUrl: notesUrl || null}})});
-    } catch { throw new Error('Jira delivery failed (network, redirect or timeout)'); }
+    } catch { throw new Error(`Jira delivery failed after ${sent} of ${tickets.length} ticket(s) (network, redirect or timeout); rerun the job to resend`); }
     // Never log response bodies, URLs or the secret.
-    if (!response.ok) throw new Error(`Jira delivery failed (HTTP ${response.status})`);
+    if (!response.ok) throw new Error(`Jira delivery failed after ${sent} of ${tickets.length} ticket(s) (HTTP ${response.status}); rerun the job to resend`);
+    sent += Math.min(JIRA_BATCH, tickets.length - index);
   }
   return {sent: true, skipped: false, tickets: tickets.length};
 }
@@ -147,7 +242,7 @@ export async function prepareDeployment(options) {
   requireValue(['success', 'failure', 'cancelled', 'skipped'].includes(status), 'Invalid DEPLOY_STATUS');
   requireValue(/^[\w.-]+\/[\w.-]+$/.test(repository || ''), 'GITHUB_REPOSITORY must be owner/repository');
   requireValue(typeof runUrl === 'string' && new RegExp(`^https://github\\.com/${repository.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/actions/runs/[0-9]+(?:/attempts/[0-9]+)?$`).test(runUrl), 'RUN_URL must be the exact repository workflow run URL');
-  let content = '', notesAvailable = false, notesUrl, tickets = [];
+  let content = '', notesAvailable = false, notesUrl;
   const warnings = [];
   if (environment === 'production' && status === 'success' && version) {
     const api = createGitHub(options);
@@ -162,14 +257,13 @@ export async function prepareDeployment(options) {
       requireValue(saved, 'Saved notes provenance is missing, malformed or stale');
       content = saved.content;
       notesAvailable = true;
-      tickets = releasedTickets(content);
       notesUrl = release ? `https://github.com/${repository}/releases/tag/${encodeURIComponent(tag)}` : `https://github.com/${repository}/pull/${pr.number}`;
     } catch {
       content = 'Release notes unavailable for this deployment.';
       warnings.push('Release notes unavailable: exact deployed provenance could not be verified.');
     }
   }
-  return {payload: buildSlackPayload({...options, content, notesUrl}), notesAvailable, notesUrl, tickets, warnings};
+  return {payload: buildSlackPayload({...options, content, notesUrl}), notesAvailable, notesUrl, warnings};
 }
 
 function escapeSlack(text) {

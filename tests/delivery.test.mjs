@@ -282,43 +282,89 @@ test('publish creates missing release even when tag already exists and verifies 
   assert.ok(fixture.calls.every(c => c.init.redirect === 'error' && c.init.signal));
 });
 
-import {renderNotes} from '../scripts/release-notes.mjs';
+import {closingKeys, branchKeys, shippedTicketKeys} from '../scripts/release-notes.mjs';
 const JIRA_HOOK = 'https://api-private.atlassian.com/automation/webhooks/jira/a/11111111-2222-3333-4444-555555555555/66666666-7777-8888-9999-000000000000';
-const ticket = key => ({key, url: `https://servefirst.atlassian.net/browse/${key}`});
-const renderedNotes = () => renderNotes({base: BASE, head: HEAD, summary: 'Summary.', items: [
-  {id: 'pr:1', kind: 'pr', number: 1, url: 'https://github.com/org/repo/pull/1', title: 'A', tickets: [ticket('SF-2'), ticket('SF-1')], status: 'included'},
-  {id: 'pr:2', kind: 'pr', number: 2, url: 'https://github.com/org/repo/pull/2', title: 'B', tickets: [ticket('SF-1')], status: 'included'},
-  {id: 'pr:3', kind: 'pr', number: 3, url: 'https://github.com/org/repo/pull/3', title: 'C', tickets: [ticket('SF-3')], status: 'reverted'},
-  {id: 'pr:4', kind: 'pr', number: 4, url: 'https://github.com/org/repo/pull/4', title: 'Revert C', tickets: [ticket('SF-4')], status: 'revert'},
-]});
+const PREV = 'd'.repeat(40), sha = n => String(n).padStart(40, 'e');
+const repoPr = (number, ref, extra = {}) => ({number, title: `Change ${number}`, body: '', merged: true, merge_commit_sha: sha(number), head: {ref, sha: sha(number + 500)}, base: {ref: 'stage', repo: {full_name: 'org/repo'}}, ...extra});
+const commit = (s, message) => ({sha: s, commit: {message}});
+const SECRET_BLOCK = '<!-- sf-release-notes:start -->\nCloses SF-99\n<!-- sf-release-notes:end -->';
+function releaseFixture({deployments = [200, [{id: 1, sha: MERGE}, {id: 2, sha: PREV}]], compare = 'ahead', extra = {}} = {}) {
+  const release = {...pr(), head: {sha: HEAD, ref: 'release/1.2'}, body: `Closes SF-6\n${SECRET_BLOCK}`};
+  const prs = {
+    10: repoPr(10, 'SF-1-thing', {body: 'Depends on SF-9. Follow-up to SF-8.'}),
+    11: repoPr(11, 'SF-3-feature'),
+    12: repoPr(12, 'revert-11-SF-3-feature', {title: 'Revert "Change 11"', body: 'Reverts org/repo#11'}),
+    13: repoPr(13, 'main', {base: {ref: 'stage', repo: {full_name: 'org/repo'}}}),
+    14: repoPr(14, 'csat-sms-step-1', {body: 'Closes [SF-7](https://servefirst.atlassian.net/browse/SF-7)'}),
+  };
+  const commits = [
+    commit(sha(1000), 'work on it\n\nCloses SF-2'),
+    commit(sha(10), 'Merge pull request #10 from org/SF-1-thing'),
+    commit(sha(11), 'Merge pull request #11 from org/SF-3-feature'),
+    commit(sha(12), 'Merge pull request #12 from org/revert-11-SF-3-feature'),
+    commit(sha(13), 'Merge pull request #13 from org/main\n\nCloses SF-98'),
+    commit(sha(14), 'CSAT SMS step 1 (#14)'),
+    commit(sha(2000), 'hotfix: cap export cells\n\nCloses SF-5'),
+    commit(sha(3000), 'chore: bump version to 1.2 SF-97'),
+    commit(MERGE, 'Merge pull request #7 from org/release/1.2'),
+  ];
+  return apiFixture({
+    'GET /pulls/7': release,
+    [`GET /commits/${MERGE}/pulls?per_page=100&page=1`]: [200, [release]],
+    'GET /deployments?environment=production&per_page=30': deployments,
+    'GET /deployments/2/statuses?per_page=100': [200, [{state: 'inactive'}, {state: 'success'}]],
+    [`GET /compare/${PREV}...${MERGE}`]: {status: compare},
+    [`GET /compare/${PREV}...${MERGE}?per_page=100&page=1`]: {total_commits: commits.length, commits},
+    [`GET /commits/${MERGE}`]: {sha: MERGE, parents: [{sha: PREV}, {sha: HEAD}]},
+    ...Object.fromEntries(Object.entries(prs).map(([n, p]) => [`GET /pulls/${n}`, p])),
+    'GET /pulls/10/commits?per_page=100&page=1': [200, [{sha: sha(1000)}, {sha: 'f'.repeat(40)}]],
+    'GET /pulls/11/commits?per_page=100&page=1': [200, []],
+    'GET /pulls/12/commits?per_page=100&page=1': [200, []],
+    'GET /pulls/14/commits?per_page=100&page=1': [200, []],
+    ...extra,
+  });
+}
 
-test('released tickets come only from included changes, never reverts or mismatched links', () => {
-  const content = d.parseNotes(renderedNotes()).content;
-  assert.deepEqual(d.releasedTickets(content), ['SF-1', 'SF-2']);
-  assert.deepEqual(d.releasedTickets('## Included changes\n- [SF-9](https://servefirst.atlassian.net/browse/SF-8) spoofed\n- SF-7 bare text'), []);
-  assert.deepEqual(d.releasedTickets('- [SF-5](https://servefirst.atlassian.net/browse/SF-5) outside any section'), []);
-  assert.deepEqual(d.releasedTickets(''), []);
+test('ticket rule: branch name or "Closes KEY" only, never a bare mention', () => {
+  assert.deepEqual(closingKeys('Closes SF-1'), ['SF-1']);
+  assert.deepEqual(closingKeys('closes: sf-2, SF-3 and SF-4.'), ['SF-2', 'SF-3', 'SF-4']);
+  assert.deepEqual(closingKeys('Closed [SF-5](https://servefirst.atlassian.net/browse/SF-5)'), ['SF-5']);
+  assert.deepEqual(closingKeys('Closes https://servefirst.atlassian.net/browse/SF-6 and also tidies SF-7'), ['SF-6']);
+  for (const text of ['Depends on SF-9', 'We could close SF-8 later', 'enclosed SF-11', 'Fixes SF-12', 'SF-13 in the title']) assert.deepEqual(closingKeys(text), [], text);
+  assert.deepEqual(branchKeys('SF-4401-gridspot-image-lost'), ['SF-4401']);
+  assert.deepEqual(branchKeys('feat/SF-12-x'), ['SF-12']);
+  assert.deepEqual(branchKeys('csat-sending-phase-4'), []);
+  assert.deepEqual(shippedTicketKeys({branch: 'SF-2-a', body: 'Closes SF-1\nSee SF-3', messages: ['Closes SF-2', 'mentions SF-4']}), ['SF-1', 'SF-2']);
 });
 
-test('verified production deploys expose released tickets; other deploys expose none', async () => {
-  const body = notes(d.parseNotes(renderedNotes()).content);
-  const fixture = apiFixture({[`GET /commits/${MERGE}/pulls?per_page=100&page=1`]: [200, [pr(body)]], 'GET /pulls/7': pr(body)});
-  const result = await d.prepareDeployment({...deployOptions, fetch: fixture.fetch});
-  assert.deepEqual(result.tickets, ['SF-1', 'SF-2']);
-  assert.equal(result.notesUrl, 'https://github.com/org/repo/pull/7');
-  const staging = await d.prepareDeployment({...deployOptions, environment: 'staging', fetch: () => assert.fail('No fetch')});
-  assert.deepEqual(staging.tickets, []);
-  const stale = await d.prepareDeployment({...deployOptions, fetch: apiFixture({[`GET /commits/${MERGE}/pulls?per_page=100&page=1`]: [200, [pr(notes(renderedNotes(), 'd'.repeat(40)))]]}).fetch});
-  assert.deepEqual(stale.tickets, []);
+test('released tickets are rebuilt from GitHub since the last production deploy, not from editable notes', async () => {
+  const fixture = releaseFixture();
+  const result = await d.releasedTickets({...deployOptions, fetch: fixture.fetch});
+  // SF-1 branch, SF-2 commit in PR 10, SF-5 direct hotfix commit, SF-6 release PR description, SF-7 PR description.
+  // Not: SF-9/SF-8 (mentions), SF-3 (reverted), SF-98 (sync wrapper), SF-97 (no "Closes"), SF-99 (inside the notes block).
+  assert.deepEqual(result.tickets, ['SF-1', 'SF-2', 'SF-5', 'SF-6', 'SF-7']);
+  assert.deepEqual(result.warnings, []);
+  assert.ok(fixture.calls.every(c => c.init.redirect === 'error' && c.init.signal));
 });
 
-test('Jira webhook is optional, allowlisted, batched, secret-headed and never leaks errors', async () => {
-  assert.deepEqual(await d.sendJiraRelease({tickets: ['SF-1'], fetch: () => assert.fail('No webhook')}), {sent: false, skipped: true, tickets: 0});
-  assert.deepEqual(await d.sendJiraRelease({webhook: JIRA_HOOK, tickets: [], fetch: () => assert.fail('No tickets')}), {sent: false, skipped: true, tickets: 0});
-  for (const bad of ['http://api-private.atlassian.com/automation/webhooks/jira/a/x', 'https://api-private.atlassian.com.evil.test/automation/webhooks/jira/a/x', 'https://evil.test/automation/webhooks/jira/a/x', JIRA_HOOK + '?x=1']) {
-    await assert.rejects(d.sendJiraRelease({webhook: bad, tickets: ['SF-1'], fetch: () => assert.fail('Bad webhook fetched')}), /Invalid Jira automation webhook URL/);
+test('released tickets: fallback range, rollback and wrong tag', async () => {
+  const noDeployments = releaseFixture({deployments: [403, {}]});
+  const fallback = await d.releasedTickets({...deployOptions, fetch: noDeployments.fetch});
+  assert.deepEqual(fallback.tickets, ['SF-1', 'SF-2', 'SF-5', 'SF-6', 'SF-7']);
+  assert.match(fallback.warnings[0], /deployments: read/);
+  const rollback = await d.releasedTickets({...deployOptions, fetch: releaseFixture({compare: 'behind'}).fetch});
+  assert.deepEqual(rollback.tickets, []);
+  assert.match(rollback.warnings[0], /not newer/);
+  await assert.rejects(d.releasedTickets({...deployOptions, fetch: releaseFixture({extra: {'GET /git/ref/tags/v1.2': {object: {type: 'commit', sha: PREV}}}}).fetch}), /Tag does not match/);
+});
+
+test('Jira webhook requires current endpoint and secret, batches, and never leaks errors', async () => {
+  for (const bad of [undefined, 'http://api-private.atlassian.com/automation/webhooks/jira/a/x/y', 'https://api-private.atlassian.com.evil.test/automation/webhooks/jira/a/x/y', 'https://automation.atlassian.com/pro/hooks/abc', JIRA_HOOK + '?x=1']) {
+    await assert.rejects(d.sendJiraRelease({webhook: bad, secret: 'shh', tickets: ['SF-1'], fetch: () => assert.fail('Bad webhook fetched')}), /Invalid Jira automation webhook URL/);
   }
-  await assert.rejects(d.sendJiraRelease({webhook: JIRA_HOOK, tickets: ['sf-1'], fetch: () => assert.fail('Bad key fetched')}), /Invalid Jira ticket keys/);
+  for (const secret of [undefined, '', 'a\nb']) await assert.rejects(d.sendJiraRelease({webhook: JIRA_HOOK, secret, tickets: ['SF-1'], fetch: () => assert.fail('No secret')}), /secret is required/);
+  assert.deepEqual(await d.sendJiraRelease({webhook: JIRA_HOOK, secret: 'shh', tickets: [], fetch: () => assert.fail('No tickets')}), {sent: false, skipped: true, tickets: 0});
+  await assert.rejects(d.sendJiraRelease({webhook: JIRA_HOOK, secret: 'shh', tickets: ['sf-1'], fetch: () => assert.fail('Bad key fetched')}), /Invalid Jira ticket keys/);
   const posts = [];
   const tickets = Array.from({length: 120}, (_, i) => `SF-${i + 1}`);
   const result = await d.sendJiraRelease({webhook: JIRA_HOOK, secret: 'shh', tickets, repository: 'org/repo', version: '1.2', notesUrl: 'https://github.com/org/repo/pull/7',
@@ -330,18 +376,18 @@ test('Jira webhook is optional, allowlisted, batched, secret-headed and never le
   assert.equal(posts[0].init.headers['X-Automation-Webhook-Token'], 'shh');
   assert.equal(posts[0].init.redirect, 'error');
   assert.ok(posts[0].init.signal);
+  let call = 0;
+  await assert.rejects(d.sendJiraRelease({webhook: JIRA_HOOK, secret: 'shh', tickets, fetch: async () => new Response('', {status: ++call === 2 ? 500 : 200})}), /after 50 of 120 ticket\(s\) \(HTTP 500\); rerun/);
   for (const fetch of [async () => new Response('secret body', {status: 401}), async () => { throw new Error(JIRA_HOOK); }]) {
     await assert.rejects(d.sendJiraRelease({webhook: JIRA_HOOK, secret: 'shh', tickets: ['SF-1'], fetch}), error => !/secret|shh|atlassian/.test(error.message));
   }
 });
 
-test('notification CLI sends Jira without Slack, and a Slack failure still reports to Jira', async () => {
+test('notification CLI: Jira only for successful production, independent of Slack', async () => {
   const {main} = await import('../scripts/notify-deployment.mjs');
-  const body = notes(d.parseNotes(renderedNotes()).content);
-  const routes = () => apiFixture({[`GET /commits/${MERGE}/pulls?per_page=100&page=1`]: [200, [pr(body)]], 'GET /pulls/7': pr(body)});
   const env = {GITHUB_REPOSITORY: 'org/repo', GH_TOKEN: 'secret', DEPLOYED_SHA: MERGE, VERSION: '1.2', ENVIRONMENT: 'production', DEPLOY_STATUS: 'success', RUN_URL: deployOptions.runUrl, JIRA_WEBHOOK_URL: JIRA_HOOK, JIRA_WEBHOOK_SECRET: 'shh'};
-  const withPosts = (fixture, slackStatus = 200) => {
-    const jira = [];
+  const withPosts = (slackStatus = 200) => {
+    const fixture = releaseFixture({extra: {'GET /releases/tags/v1.2': [404, {}]}}), jira = [];
     const fetch = async (url, init) => {
       if (url === JIRA_HOOK) { jira.push(JSON.parse(init.body)); return new Response('{}'); }
       if (url.startsWith('https://hooks.slack.com/')) return new Response('', {status: slackStatus});
@@ -349,14 +395,26 @@ test('notification CLI sends Jira without Slack, and a Slack failure still repor
     };
     return {fetch, jira};
   };
-  const jiraOnly = withPosts(routes());
-  const result = await main(env, {fetch: jiraOnly.fetch, log: () => {}, warn: () => {}});
+  const quiet = {log: () => {}, warn: () => {}};
+  const jiraOnly = withPosts();
+  const result = await main(env, {fetch: jiraOnly.fetch, ...quiet});
   assert.equal(result.jira.sent, true);
-  assert.deepEqual(jiraOnly.jira.map(b => b.issues), [['SF-1', 'SF-2']]);
-  const slackDown = withPosts(routes(), 500);
-  await assert.rejects(main({...env, SLACK_WEBHOOK_URL: 'https://hooks.slack.com/services/T1/B2/S3'}, {fetch: slackDown.fetch, log: () => {}, warn: () => {}}), /Slack delivery failed/);
-  assert.deepEqual(slackDown.jira.map(b => b.issues), [['SF-1', 'SF-2']]);
-  const staging = withPosts(routes());
-  await main({...env, ENVIRONMENT: 'staging'}, {fetch: staging.fetch, log: () => {}, warn: () => {}});
-  assert.deepEqual(staging.jira, []);
+  assert.deepEqual(jiraOnly.jira.map(b => b.issues), [['SF-1', 'SF-2', 'SF-5', 'SF-6', 'SF-7']]);
+  assert.equal(jiraOnly.jira[0].data.notesUrl, 'https://github.com/org/repo/pull/7');
+  const slackDown = withPosts(500);
+  await assert.rejects(main({...env, SLACK_WEBHOOK_URL: 'https://hooks.slack.com/services/T1/B2/S3'}, {fetch: slackDown.fetch, ...quiet}), /Slack delivery failed/);
+  assert.equal(slackDown.jira.length, 1);
+  // Staging and failed deploys never validate or call Jira, even with a broken Jira config.
+  for (const extra of [{ENVIRONMENT: 'staging'}, {DEPLOY_STATUS: 'failure', DEPLOYED_SHA: '', VERSION: ''}]) {
+    const other = withPosts();
+    await main({...env, ...extra, JIRA_WEBHOOK_URL: 'https://not-jira.test/x', JIRA_WEBHOOK_SECRET: ''}, {fetch: other.fetch, ...quiet});
+    assert.deepEqual(other.jira, []);
+  }
+  const dry = withPosts(), logs = [];
+  const directory = await mkdtemp(join(tmpdir(), 'delivery-test-'));
+  try {
+    await main({...env, DRY_RUN: 'true', PAYLOAD_FILE: join(directory, 'p.json')}, {fetch: dry.fetch, log: line => logs.push(line), warn: () => {}});
+  } finally { await rm(directory, {recursive: true, force: true}); }
+  assert.deepEqual(dry.jira, []);
+  assert.ok(logs.some(line => /would report 5 released ticket\(s\): SF-1, SF-2, SF-5, SF-6, SF-7/.test(line)));
 });
