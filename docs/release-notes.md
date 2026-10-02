@@ -55,7 +55,7 @@ In standalone deployment jobs, replace the old `8398a7/action-slack` step:
     webhook-url: ${{ secrets.SLACK_WEBHOOK_URL_PROD }} # select explicitly by environment
 ```
 
-Capture `deployed` outputs from the actual checkout using `git rev-parse HEAD` and the checkout's package.json. Do not substitute `github.sha`: a manual deployment can select a different ref. Where setup/build are separate jobs, resolve the ref once and pin build to that SHA. Grant the notification job only `contents: read` and `pull-requests: read`; preserve the actual deployment job's existing OIDC/deployment permissions.
+Capture `deployed` outputs from the actual checkout using `git rev-parse HEAD` and the checkout's package.json. Do not substitute `github.sha`: a manual deployment can select a different ref. Where setup/build are separate jobs, resolve the ref once and pin build to that SHA. Grant the notification job only `contents: read` and `pull-requests: read` (plus `deployments: read` if it reports to Jira, see below); preserve the actual deployment job's existing OIDC/deployment permissions.
 
 For a separate notification-only job, use `environment: { name: <target>, deployment: false }` to retain environment-scoped secrets without creating a misleading successful deployment record. Pass the actual setup/deployment job results through `needs`, not the notification job's own `job.status`. GitHub does not support `deployment: false` with custom deployment protection rules; check the target environments first.
 
@@ -70,17 +70,17 @@ GitHub for Jira only links a production deployment to tickets it finds in roughl
 A ticket counts as shipped by a change only if:
 
 - its key is in the **branch name**, for example `SF-4401-gridspot-image-lost` or `feat/SF-12-export`, or
-- a **"Closes" line** names it in the PR description or a commit message: `Closes SF-123`, `Closes: SF-1, SF-2 and SF-3`, or `Closes [SF-123](https://servefirst.atlassian.net/browse/SF-123)`. `Closed` also works. The keyword must come straight before the keys.
+- a line in the PR description or a commit message **starts with "Closes"**: `Closes SF-123`, `Closes: SF-1, SF-2 and SF-3`, `* Closes SF-123` or `Closes [SF-123](https://servefirst.atlassian.net/browse/SF-123)`. `Closed` also works. "…it closes SF-1" in the middle of a sentence does not count. For a squash merge, only the final squash message is read, so keep the Closes line in it (GitHub's default squash message already includes the commit messages).
 
-Mentions anywhere else never count: PR titles, "Depends on SF-9", "Follow-up to SF-8", or a key in passing text. So a branch without a key, such as `csat-sms-step-1`, needs a `Closes SF-…` line or its ticket is not moved. A hotfix with a fix commit that says `Closes SF-…` (or that comes from a ticket branch) reports it too. A "Closes" line in the release or hotfix PR description itself also counts, which helps for direct commits. The release notes use the same rule, so the tickets linked in the notes match what Jira is told.
+Mentions anywhere else never count: PR titles, "Depends on SF-9", "Follow-up to SF-8", or a key in passing text. So a branch without a key, such as `csat-sms-step-1`, needs a `Closes SF-…` line or its ticket is not moved. A hotfix with a fix commit that says `Closes SF-…` (or that comes from a ticket branch) reports it too. A "Closes" line in the release or hotfix PR description itself also counts, which helps for direct commits. The release notes use the same rule for their ticket links. They cover only this release PR's range, so after a skipped deploy Jira can be told about more tickets than the notes list.
 
 ### What is sent, and when
 
-Only on a **successful production** deploy, the action rebuilds the list from GitHub at deploy time. It does not read it from the editable notes text, so editing the release PR body cannot add or drop tickets.
+Only on a **successful production** deploy, the action rebuilds the list from GitHub at deploy time. Each commit is matched to its PR with GitHub's commit-to-PR lookup, so merge, squash and rebase merges all work. Editing the generated notes block does not change which tickets are reported.
 
-- **Range:** from the last successful production deployment recorded in GitHub to the deployed commit. A release that merged but never deployed is then still reported by the next deploy that ships it. If deployments can't be read (the job lacks `deployments: read`), it falls back to this release PR only and logs a warning.
-- **Reverts:** a revert PR or commit never reports a ticket, and neither does the change it reverts within the range. When unsure, a ticket is left out rather than closed.
-- **Rollbacks:** deploying an older version than the last production deploy reports nothing.
+- **Range:** from the previous successful production deployment recorded in GitHub to the deployed commit. A release that merged but never deployed is then still reported by the next deploy that ships it. If there is no earlier production deployment at all, only this release PR's changes are reported, with a warning. If deployments can't be read (the job lacks `deployments: read`), nothing is sent and the step fails so it is visible.
+- **Reverts:** a revert never reports a ticket, and every ticket on what it reverts is left out, even if another change also closes it. A revert of a revert also leaves the ticket out. When unsure, a ticket is left out rather than closed; move those by hand.
+- **Rollbacks:** deploying an older or the same version as the previous production deploy reports nothing, and so does a deploy whose history doesn't include the previous one.
 - **Payload:** ticket keys in batches of 50:
 
 ```json

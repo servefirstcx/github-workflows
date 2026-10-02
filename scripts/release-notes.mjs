@@ -30,12 +30,13 @@ export function branchKeys(ref = '') {
 }
 
 /**
- * "Closes SF-1", "Closes: SF-1, SF-2 and SF-3", "Closes [SF-1](https://x.atlassian.net/browse/SF-1)".
- * Only the close keyword counts, never a bare mention elsewhere.
+ * A line starting "Closes SF-1", "Closes: SF-1, SF-2 and SF-3" or
+ * "Closed [SF-1](https://x.atlassian.net/browse/SF-1)". Never a mention elsewhere.
  */
 export function closingKeys(text = '') {
   const keys = [];
-  for (const match of String(text).matchAll(/\bclose[sd]:?[ \t]+([^\r\n]+)/gi)) {
+  // Must start the line (optionally as a list item or quote), e.g. squash messages' "* Closes SF-1".
+  for (const match of String(text).matchAll(/^[ \t]*(?:[-*>][ \t]+)?close[sd]:?[ \t]+([^\r\n]+)/gim)) {
     for (const part of match[1].split(/[ \t]*,[ \t]*|[ \t]+and[ \t]+|[ \t]+/i)) {
       const token = part.match(TOKEN);
       if (!token) break;
