@@ -113,10 +113,12 @@ export async function releasedTickets(options) {
       if (!messages.has(target)) continue;
       for (const key of changeKeys(target)) dropped.add(key);
       for (const number of prsOf.get(target)) dropPr(number);
-      // A reverted hotfix merge, or a reverted commit inside an earlier hotfix, drops that hotfix.
-      // (Every commit is inside the release being deployed, so that one is never dropped this way.)
+      // A reverted hotfix merge, or a reverted commit inside a hotfix, drops that hotfix's tickets.
+      // Every commit belongs to the release PR being deployed, so a normal release/* PR is exempt,
+      // but a hotfix being deployed is not: part of its fix was undone.
       for (const pr of releases.values()) {
-        if (pr.number !== release.number && (pr.merge_commit_sha === target || releaseShas.get(pr.number)?.includes(target))) dropPr(pr.number);
+        const exempt = pr.number === release.number && !/^hotfix\//.test(pr.head?.ref || '');
+        if (!exempt && (pr.merge_commit_sha === target || releaseShas.get(pr.number)?.includes(target))) dropPr(pr.number);
       }
     }
   }

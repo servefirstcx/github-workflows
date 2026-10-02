@@ -451,6 +451,19 @@ test('released tickets: reverting a commit inside a hotfix drops the hotfix bran
   assert.deepEqual(result.tickets, ['SF-6']);
 });
 
+test('released tickets: a deployed hotfix whose fix was reverted reports nothing', async () => {
+  const hotfix = {...pr(), merged_at: '2026-01-02T00:00:00Z', head: {sha: HEAD, ref: 'hotfix/SF-78-cells', repo: {full_name: 'org/repo'}}, base: {ref: 'main', repo: {full_name: 'org/repo'}}, body: null};
+  const range = [
+    [commit(sha(8101), 'neutral fix'), [hotfix]],
+    [commit(sha(8102), 'Revert "neutral fix"\n\nThis reverts commit ' + sha(8101) + '.'), [hotfix]],
+    [commit(MERGE, 'Merge pull request #7 from org/hotfix/SF-78-cells'), [hotfix]],
+  ];
+  const result = await d.releasedTickets({...deployOptions, fetch: releaseFixture({range, extra: {'GET /pulls/7': hotfix}}).fetch});
+  assert.deepEqual(result.tickets, []);
+  const kept = await d.releasedTickets({...deployOptions, fetch: releaseFixture({range: [range[0], range[2]], extra: {'GET /pulls/7': hotfix}}).fetch});
+  assert.deepEqual(kept.tickets, ['SF-78']);
+});
+
 test('released tickets: long deployment history is fine when the previous deploy is near the top', async () => {
   const full = [{id: 1, sha: MERGE}, {id: 2, sha: PREV}, ...Array.from({length: 98}, (_, i) => ({id: 1000 + i, sha: sha(7000 + i)}))];
   const fixture = releaseFixture({deployments: [200, full]});
