@@ -75,9 +75,11 @@ Nothing is sent for staging/dev, failed deploys, or unverifiable notes (a warnin
 
 **Jira rule (SF project):**
 1. Trigger: *Incoming webhook*, "Issues provided in the webhook HTTP POST body". Copy the URL and secret.
-2. Condition: status is not *Done (In Production)*, *Done (No-code Task)* or *Closed (Archived)*.
+2. Condition (JQL): `project = SF AND status not in ("Done (In Production)", "Done (No-code Task)", "Closed (Archived)")`, which also ignores keys from other projects.
 3. Action: transition to *Done (In Production)*.
-4. Action: comment `Released to production in {{webhookData.repository}} v{{webhookData.version}} — {{webhookData.notesUrl}}`.
+4. Action: comment `Released to production in {{webhookData.data.repository}} v{{webhookData.data.version}}: {{webhookData.data.notesUrl}}` (the extra fields sit under `data` in the POST body).
+
+This rule exists in SF as **"Release workflow → mark released tickets Done (In Production)"**. The old sprint-close rule that bulk-moved Dev Complete tickets has been disabled.
 
 Store the URL and secret as Actions secrets **`JIRA_RELEASE_WEBHOOK_URL`** and **`JIRA_RELEASE_WEBHOOK_SECRET`** on the application repositories, and pass them to the notification step alongside the Slack webhook:
 
