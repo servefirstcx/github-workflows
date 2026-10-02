@@ -52,8 +52,9 @@ export async function releasedTickets(options) {
 
   const commits = await rangeCommits(api, base, deployedSha);
   const messages = new Map(commits.map(c => [c.sha, c.commit?.message || '']));
-  const isSync = pr => [mainBranch, stagingBranch].includes(pr.head?.ref);
-  const isRelease = pr => /^(?:release|hotfix)\//.test(pr.head?.ref || '');
+  // Internal main<->stage sync PRs only; a fork's own main branch is an ordinary PR.
+  const isSync = pr => pr.head?.repo?.full_name === repository && [mainBranch, stagingBranch].includes(pr.head?.ref) && [mainBranch, stagingBranch].includes(pr.base?.ref);
+  const isRelease = pr => pr.head?.repo?.full_name === repository && /^(?:release|hotfix)\//.test(pr.head?.ref || '');
   const prs = new Map(), prsOf = new Map(), releases = new Map([[release.number, release]]), releaseShas = new Map(), syncCommits = new Set();
   for (const sha of messages.keys()) {
     const found = new Set();
@@ -98,7 +99,7 @@ export async function releasedTickets(options) {
   const reverting = [...prs.values(), ...releases.values()].filter(pr => isRevert(pr.title) || /^revert-/.test(pr.head?.ref || ''));
   for (const pr of reverting) {
     revertPrs.add(pr.number);
-    for (const m of String(pr.body || '').matchAll(/\bReverts\s+(?:([\w.-]+\/[\w.-]+))?#(\d+)\b/gi)) {
+    for (const m of String(pr.body || '').replace(NOTES_BLOCK, '').matchAll(/\bReverts\s+(?:([\w.-]+\/[\w.-]+))?#(\d+)\b/gi)) {
       if (!m[1] || m[1].toLowerCase() === repository.toLowerCase()) dropPr(Number(m[2]));
     }
   }
@@ -131,23 +132,12 @@ export async function releasedTickets(options) {
 
 /** Previous successful production deployment. Fails closed when it can't be read. */
 async function reportingBase(api, deployedSha) {
+  // Newest first. Candidates start after this deploy's own record, so reruns and replays look
+  // further back. Pages are read only until the answer is known.
   const deployments = [];
-  for (let page = 1; ; page++) {
-    requireValue(page <= 10, 'Too many production deployments; cannot establish the previous one');
-    let list;
-    try { list = await api(`/deployments?environment=production&per_page=100&page=${page}`); }
-    catch (error) {
-      if (error.status === 403 || error.status === 404) throw new Error('Cannot read production deployments; give the notification job deployments: read');
-      throw error;
-    }
-    requireValue(Array.isArray(list), 'Invalid deployments response');
-    deployments.push(...list);
-    if (list.length < 100) break;
-  }
-  // Newest first. Start after this deploy's own record(s), so reruns and replays look further back.
-  const own = deployments.findIndex(deployment => deployment?.sha === deployedSha);
-  for (const deployment of deployments.slice(own + 1)) {
-    if (deployment.sha === deployedSha || !SHA.test(deployment.sha || '') || !Number.isSafeInteger(deployment.id)) continue;
+  let checked = 0, done = false;
+  const evaluate = async deployment => {
+    if (deployment.sha === deployedSha || !SHA.test(deployment.sha || '') || !Number.isSafeInteger(deployment.id)) return null;
     // A newer deploy marks older ones "inactive"; any success means it reached production.
     let succeeded = false;
     for (let page = 1; !succeeded; page++) {
@@ -157,11 +147,30 @@ async function reportingBase(api, deployedSha) {
       succeeded = statuses.some(item => item?.state === 'success');
       if (statuses.length < 100) break;
     }
-    if (!succeeded) continue;
+    if (!succeeded) return null;
     const {status} = await api(`/compare/${deployment.sha}...${deployedSha}`);
     if (status === 'ahead') return {base: deployment.sha, warnings: []};
     if (status === 'behind' || status === 'identical') return {base: null, warnings: ['Deployed version is not newer than the previous production deployment (rollback or redeploy); no tickets reported.']};
     return {base: null, warnings: ['Previous production deployment is not an ancestor of this one; no tickets reported. Mark them in Jira by hand.']};
+  };
+  for (let page = 1; !done; page++) {
+    requireValue(page <= 10, 'Too many production deployments; cannot establish the previous one');
+    let list;
+    try { list = await api(`/deployments?environment=production&per_page=100&page=${page}`); }
+    catch (error) {
+      if (error.status === 403 || error.status === 404) throw new Error('Cannot read production deployments; give the notification job deployments: read');
+      throw error;
+    }
+    requireValue(Array.isArray(list), 'Invalid deployments response');
+    deployments.push(...list);
+    done = list.length < 100;
+    const own = deployments.findIndex(deployment => deployment?.sha === deployedSha);
+    // Until this deploy's own record shows up, every record seen so far may be newer than it.
+    if (own < 0 && !done) continue;
+    for (checked = Math.max(checked, own + 1); checked < deployments.length; checked++) {
+      const result = await evaluate(deployments[checked]);
+      if (result) return result;
+    }
   }
   // First ever recorded production deploy: report only this release PR's own changes.
   const parent = (await api(`/commits/${deployedSha}`)).parents?.[0]?.sha;

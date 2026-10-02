@@ -285,12 +285,12 @@ test('publish creates missing release even when tag already exists and verifies 
 import {closingKeys, branchKeys, shippedTicketKeys} from '../scripts/release-notes.mjs';
 const JIRA_HOOK = 'https://api-private.atlassian.com/automation/webhooks/jira/a/11111111-2222-3333-4444-555555555555/66666666-7777-8888-9999-000000000000';
 const PREV = 'd'.repeat(40), GAP = '9'.repeat(40), sha = n => String(n).padStart(40, 'e');
-const repoPr = (number, ref, extra = {}) => ({number, title: `Change ${number}`, body: '', merged_at: '2026-01-01T00:00:00Z', merged: true, merge_commit_sha: sha(number), head: {ref, sha: sha(number + 500)}, base: {ref: 'stage', repo: {full_name: 'org/repo'}}, ...extra});
+const repoPr = (number, ref, extra = {}) => ({number, title: `Change ${number}`, body: '', merged_at: '2026-01-01T00:00:00Z', merged: true, merge_commit_sha: sha(number), head: {ref, sha: sha(number + 500), repo: {full_name: 'org/repo'}}, base: {ref: 'stage', repo: {full_name: 'org/repo'}}, ...extra});
 const commit = (s, message) => ({sha: s, commit: {message}});
 const SECRET_BLOCK = '<!-- sf-release-notes:start -->\nCloses SF-99\n<!-- sf-release-notes:end -->';
 /** A release range: each commit lists the PRs GitHub associates with it. */
 function releaseFixture({deployments = [200, [{id: 1, sha: MERGE}, {id: 2, sha: PREV}]], compare = 'ahead', extra = {}, range} = {}) {
-  const release = {...pr(), merged_at: '2026-01-02T00:00:00Z', head: {sha: HEAD, ref: 'release/1.2'}, base: {ref: 'main', repo: {full_name: 'org/repo'}}, body: `Closes SF-6\n${SECRET_BLOCK}`};
+  const release = {...pr(), merged_at: '2026-01-02T00:00:00Z', head: {sha: HEAD, ref: 'release/1.2', repo: {full_name: 'org/repo'}}, base: {ref: 'main', repo: {full_name: 'org/repo'}}, body: `Closes SF-6\n${SECRET_BLOCK}`};
   const p = {
     10: repoPr(10, 'SF-1-thing', {body: 'Depends on SF-9. Follow-up to SF-8.'}),
     11: repoPr(11, 'SF-3-feature'),
@@ -369,7 +369,7 @@ test('released tickets: range comes from the previous production deploy, and fai
 });
 
 test('released tickets: reverted content commits and reverted hotfixes report nothing', async () => {
-  const release = {...pr(), merged_at: '2026-01-02T00:00:00Z', head: {sha: HEAD, ref: 'release/1.2'}, base: {ref: 'main', repo: {full_name: 'org/repo'}}, body: ''};
+  const release = {...pr(), merged_at: '2026-01-02T00:00:00Z', head: {sha: HEAD, ref: 'release/1.2', repo: {full_name: 'org/repo'}}, base: {ref: 'main', repo: {full_name: 'org/repo'}}, body: ''};
   const feature = repoPr(20, 'SF-20-thing', {merge_commit_sha: sha(20)});
   const hotfix = repoPr(21, 'hotfix/1.1.1', {base: {ref: 'main', repo: {full_name: 'org/repo'}}, body: 'Closes SF-91', merge_commit_sha: sha(21)});
   const range = [
@@ -387,7 +387,7 @@ test('released tickets: reverted content commits and reverted hotfixes report no
 });
 
 test('released tickets: a reverted hotfix drops the PRs merged into it, and the notes block never counts', async () => {
-  const release = {...pr(), merged_at: '2026-01-02T00:00:00Z', head: {sha: HEAD, ref: 'release/1.2'}, base: {ref: 'main', repo: {full_name: 'org/repo'}}, body: ''};
+  const release = {...pr(), merged_at: '2026-01-02T00:00:00Z', head: {sha: HEAD, ref: 'release/1.2', repo: {full_name: 'org/repo'}}, base: {ref: 'main', repo: {full_name: 'org/repo'}}, body: ''};
   const hotfix = repoPr(30, 'hotfix/1.1.2', {base: {ref: 'main', repo: {full_name: 'org/repo'}}, merge_commit_sha: sha(30), body: '<!-- sf-release-notes:start -->\nCloses SF-93\n<!-- sf-release-notes:end -->'});
   const feature = repoPr(31, 'SF-71-feature', {base: {ref: 'hotfix/1.1.2', repo: {full_name: 'org/repo'}}, body: 'Closes SF-72', merge_commit_sha: sha(31)});
   const range = [
@@ -415,6 +415,25 @@ test('released tickets: deployment statuses and history are read to the end, or 
   const pages = Object.fromEntries(Array.from({length: 10}, (_, i) => [`GET /deployments?environment=production&per_page=100&page=${i + 1}`, [200, full]]));
   for (const {id} of full) pages[`GET /deployments/${id}/statuses?per_page=100&page=1`] = [200, [{state: 'failure'}]];
   await assert.rejects(d.releasedTickets({...deployOptions, fetch: releaseFixture({extra: pages}).fetch}), /Too many production deployments/);
+});
+
+test('released tickets: fork PRs from a branch named main count; notes-block "Reverts" never drops tickets', async () => {
+  const release = {...pr(), merged_at: '2026-01-02T00:00:00Z', head: {sha: HEAD, ref: 'release/1.2', repo: {full_name: 'org/repo'}}, base: {ref: 'main', repo: {full_name: 'org/repo'}}, body: ''};
+  const fork = repoPr(40, 'main', {head: {ref: 'main', sha: sha(940), repo: {full_name: 'contributor/repo'}}, body: 'Closes SF-77'});
+  const feature = repoPr(41, 'SF-93-thing');
+  const other = repoPr(42, 'SF-94-other');
+  const revert = repoPr(43, 'revert-42-SF-94-other', {title: 'Revert "Change 42"', body: 'Reverts org/repo#42\n<!-- sf-release-notes:start -->\nReverts org/repo#41\n<!-- sf-release-notes:end -->'});
+  const range = [40, 41, 42, 43].map(n => [commit(sha(n), `Merge pull request #${n} from x/y`), [{40: fork, 41: feature, 42: other, 43: revert}[n], release]]);
+  range.push([commit(MERGE, 'Merge pull request #7 from org/release/1.2'), [release]]);
+  const result = await d.releasedTickets({...deployOptions, fetch: releaseFixture({range, extra: {'GET /pulls/7': release}}).fetch});
+  assert.deepEqual(result.tickets, ['SF-77', 'SF-93']);
+});
+
+test('released tickets: long deployment history is fine when the previous deploy is near the top', async () => {
+  const full = [{id: 1, sha: MERGE}, {id: 2, sha: PREV}, ...Array.from({length: 98}, (_, i) => ({id: 1000 + i, sha: sha(7000 + i)}))];
+  const fixture = releaseFixture({deployments: [200, full]});
+  assert.ok((await d.releasedTickets({...deployOptions, fetch: fixture.fetch})).tickets.includes('SF-1'));
+  assert.ok(!fixture.calls.some(c => c.key.includes('deployments?environment=production&per_page=100&page=2')), 'stops reading once the previous deploy is known');
 });
 
 test('Jira webhook requires current endpoint and secret, batches, and never leaks errors', async () => {
