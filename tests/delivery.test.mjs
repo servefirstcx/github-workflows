@@ -26,25 +26,42 @@ test('strict notes parser preserves human Markdown with provenance', () => {
 const pr = (body = notes()) => ({number: 7, title: 'Release 1.2', body, merged: true, merge_commit_sha: MERGE, head: {sha: HEAD}, base: {ref: 'main', sha: MERGE}, labels: [{name: 'release'}], html_url: 'https://github.com/org/repo/pull/7'});
 // Answers the batched associatedPullRequests GraphQL query from the same
 // `GET /commits/{sha}/pulls` routes the REST fallback uses, so one fixture covers both.
-// "a b { c } d" -> {a: true, b: {c: true}, d: true}. Deliberately tiny: plain field names
-// and braces only. Aliases, directives, arguments or fragments fail the test outright,
-// so this fixture can never answer with a field real GraphQL would have renamed or omitted.
-function parseSelection(text) {
+// The slice of GitHub's PullRequest schema the query uses: true = scalar, object = needs a sub-selection.
+const PR_SCHEMA = {number: true, title: true, body: true, mergedAt: true, baseRefName: true, headRefName: true,
+  mergeCommit: {oid: true}, baseRepository: {nameWithOwner: true}, headRepository: {nameWithOwner: true}};
+
+// "a b { c } d" -> {a: true, b: {c: true}, d: true}, checked against PR_SCHEMA the way GitHub
+// would: unknown fields, a sub-selection on a scalar or a bare object field are errors.
+// Deliberately tiny: aliases, directives, arguments and fragments fail outright, so this
+// fixture can never answer with a field real GraphQL would have renamed, omitted or rejected.
+function parseSelection(text, schema = PR_SCHEMA) {
   assert.match(text, /^[A-Za-z_{}\s]*$/, `Unsupported GraphQL selection syntax in fixture: ${text}`);
   const tokens = text.match(/[A-Za-z_]+|[{}]/g) || [];
-  const read = () => {
+  const read = type => {
     const out = {};
     while (tokens.length && tokens[0] !== '}') {
       const name = tokens.shift();
-      if (tokens[0] === '{') { tokens.shift(); out[name] = read(); tokens.shift(); } else out[name] = true;
+      assert.ok(name !== '{' && Object.hasOwn(type, name), `Unknown GraphQL field in fixture: ${name}`);
+      if (tokens[0] === '{') {
+        assert.ok(type[name] !== true, `Sub-selection on scalar field ${name}`);
+        tokens.shift(); out[name] = read(type[name]);
+        assert.equal(tokens.shift(), '}', `Unclosed selection on ${name}`);
+        assert.ok(Object.keys(out[name]).length, `Empty selection on ${name}`);
+      } else {
+        assert.ok(type[name] === true, `Object field ${name} needs a sub-selection`);
+        out[name] = true;
+      }
     }
     return out;
   };
-  return read();
+  const result = read(schema);
+  assert.equal(tokens.length, 0, `Unbalanced GraphQL selection in fixture: ${text}`);
+  return result;
 }
 
 function pick(value, selection) {
-  if (selection === true || value === null || value === undefined) return value;
+  if (value === null || value === undefined) return value;
+  if (selection === true) { assert.ok(typeof value !== 'object', 'Scalar selection returned an object'); return value; }
   return Object.fromEntries(Object.entries(selection).filter(([k]) => k in value).map(([k, sub]) => [k, pick(value[k], sub)]));
 }
 
@@ -78,7 +95,12 @@ function graphqlData(routes, {query, variables}) {
       if (list.length < 100) break;
     }
     // Only the fields (and nested fields) the query actually selects, so changing PR_FIELDS fails tests.
-    const selection = parseSelection(query.match(/nodes \{ (.*?) \} \} \} \}/)?.[1] || '');
+    // The braces after this alias's "nodes", matched by depth rather than a regex, so a short cut can't pass.
+    const at = query.indexOf(`${alias}: object(`), open = query.indexOf('nodes {', at) + 'nodes '.length;
+    assert.ok(at >= 0 && open > at, `No nodes selection for ${alias}`);
+    let depth = 0, close = open;
+    for (; close < query.length; close++) { if (query[close] === '{') depth++; else if (query[close] === '}' && --depth === 0) break; }
+    const selection = parseSelection(query.slice(open + 1, close));
     const full = p => ({number: p.number, title: p.title, body: p.body, mergedAt: p.merged_at || null,
       mergeCommit: p.merge_commit_sha ? {oid: p.merge_commit_sha} : null,
       baseRefName: p.base?.ref, baseRepository: p.base?.repo ? {nameWithOwner: p.base.repo.full_name} : null,
@@ -606,9 +628,10 @@ test('released tickets: a PR from a deleted fork keeps its branch ticket and is 
   assert.deepEqual(result.tickets, ['SF-6', 'SF-77']);
 });
 
-test('GraphQL fixture rejects aliases and directives instead of guessing', () => {
+test('GraphQL fixture rejects aliases, directives, unknown fields and bare object fields instead of guessing', () => {
   assert.deepEqual(parseSelection('number mergeCommit { oid } headRepository { nameWithOwner }'), {number: true, mergeCommit: {oid: true}, headRepository: {nameWithOwner: true}});
   for (const text of ['mergeCommit { renamed: oid }', 'mergeCommit { oid @skip(if: true) }', 'number ...F']) assert.throws(() => parseSelection(text), /Unsupported GraphQL selection/);
+  for (const text of ['mergeCommit', 'baseRepository', 'headRepository', 'number { x }', 'mergeCommit { }', 'mergeCommit { id }', 'nope', 'number }', 'mergeCommit { oid']) assert.throws(() => parseSelection(text), /GraphQL|selection|field/, text);
 });
 
 test('released tickets: dropping a selected GraphQL field changes the result (fixture honours the query)', async () => {
@@ -617,7 +640,7 @@ test('released tickets: dropping a selected GraphQL field changes the result (fi
   const strip = async (url, init = {}) => {
     if (String(url).endsWith('/graphql')) {
       const body = JSON.parse(init.body);
-      body.query = body.query.replace('number title body mergedAt', 'number title mergedAt');
+      body.query = body.query.replaceAll('number title body mergedAt', 'number title mergedAt');
       init = {...init, body: JSON.stringify(body)};
     }
     return original(url, init);
