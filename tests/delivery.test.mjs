@@ -26,6 +26,25 @@ test('strict notes parser preserves human Markdown with provenance', () => {
 const pr = (body = notes()) => ({number: 7, title: 'Release 1.2', body, merged: true, merge_commit_sha: MERGE, head: {sha: HEAD}, base: {ref: 'main', sha: MERGE}, labels: [{name: 'release'}], html_url: 'https://github.com/org/repo/pull/7'});
 // Answers the batched associatedPullRequests GraphQL query from the same
 // `GET /commits/{sha}/pulls` routes the REST fallback uses, so one fixture covers both.
+// "a b { c } d" -> {a: true, b: {c: true}, d: true}
+function parseSelection(text) {
+  const tokens = text.match(/[A-Za-z_]+|[{}]/g) || [];
+  const read = () => {
+    const out = {};
+    while (tokens.length && tokens[0] !== '}') {
+      const name = tokens.shift();
+      if (tokens[0] === '{') { tokens.shift(); out[name] = read(); tokens.shift(); } else out[name] = true;
+    }
+    return out;
+  };
+  return read();
+}
+
+function pick(value, selection) {
+  if (selection === true || value === null || value === undefined) return value;
+  return Object.fromEntries(Object.entries(selection).filter(([k]) => k in value).map(([k, sub]) => [k, pick(value[k], sub)]));
+}
+
 function graphqlFromRest(routes, request) {
   const override = routes['POST /graphql'];
   const value = override ? (typeof override === 'function' ? override(request) : override) : graphqlData(routes, request);
@@ -48,13 +67,13 @@ function graphqlData(routes, {query, variables}) {
       pages.push(...list);
       if (list.length < 100) break;
     }
-    // Only the fields the query actually selects, so dropping one from PR_FIELDS fails tests.
-    const selection = query.match(/nodes \{ (.*?) \} \} \} \}/)?.[1] || '';
-    const selected = new Set(selection.replace(/\{[^}]*\}/g, '').trim().split(/\s+/));
-    const nodes = pages.map(p => Object.fromEntries(Object.entries({number: p.number, title: p.title, body: p.body, mergedAt: p.merged_at || null,
+    // Only the fields (and nested fields) the query actually selects, so changing PR_FIELDS fails tests.
+    const selection = parseSelection(query.match(/nodes \{ (.*?) \} \} \} \}/)?.[1] || '');
+    const full = p => ({number: p.number, title: p.title, body: p.body, mergedAt: p.merged_at || null,
       mergeCommit: p.merge_commit_sha ? {oid: p.merge_commit_sha} : null,
       baseRefName: p.base?.ref, baseRepository: p.base?.repo ? {nameWithOwner: p.base.repo.full_name} : null,
-      headRefName: p.head?.ref, headRepository: p.head?.repo ? {nameWithOwner: p.head.repo.full_name} : null}).filter(([field]) => selected.has(field))));
+      headRefName: p.head?.ref, headRepository: p.head?.repo ? {nameWithOwner: p.head.repo.full_name} : null});
+    const nodes = pages.map(p => pick(full(p), selection));
     repository[alias] = {associatedPullRequests: {totalCount: nodes.length, nodes: nodes.slice(0, 100)}};
   }
   return {data: {repository}};
