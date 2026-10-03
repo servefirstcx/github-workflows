@@ -138,8 +138,9 @@ const PR_FIELDS = 'number title body mergedAt mergeCommit { oid } baseRefName ba
 
 /**
  * Merged-or-not PRs containing each commit, the same list as GET /commits/{sha}/pulls,
- * but 100 commits per GraphQL request instead of one REST call each. A commit with
- * more than 100 PRs falls back to paginated REST. Any missing commit or error fails closed.
+ * but 100 commits per GraphQL request instead of one REST call each. A commit with more
+ * than 100 PRs or a null PR node uses paginated REST, and so does a whole batch if the
+ * GraphQL request fails. A missing commit, or REST failing too, fails closed.
  */
 async function associatedPullRequests(api, shas) {
   const [owner, name] = api.repository.split('/');
@@ -151,11 +152,16 @@ async function associatedPullRequests(api, shas) {
         ${batch.map((_, i) => `c${i}: object(oid: $c${i}) { ... on Commit { associatedPullRequests(first: 100) { totalCount nodes { ${PR_FIELDS} } } } }`).join('\n        ')}
       }
     }`;
-    const data = await api.graphql(query, {owner, name, ...Object.fromEntries(batch.map((sha, i) => [`c${i}`, sha]))});
+    let data;
+    // A failed batch (errors[], GitHub's 10s query timeout, a rate limit) is retried one commit
+    // at a time over REST, which still fails closed if GitHub is really down.
+    try { data = await api.graphql(query, {owner, name, ...Object.fromEntries(batch.map((sha, i) => [`c${i}`, sha]))}); }
+    catch { for (const sha of batch) result.set(sha, await restPullRequests(api, sha)); continue; }
     for (const [i, sha] of batch.entries()) {
       const prs = data?.repository?.[`c${i}`]?.associatedPullRequests;
       requireValue(prs && Number.isSafeInteger(prs.totalCount) && Array.isArray(prs.nodes), 'Invalid associated pull request response');
-      if (prs.totalCount > prs.nodes.length) { result.set(sha, await restPullRequests(api, sha)); continue; }
+      // More than 100 PRs, or a PR GitHub couldn't return (a null node): use the complete REST list.
+      if (prs.totalCount > prs.nodes.length || prs.nodes.some(node => !node || !Number.isSafeInteger(node.number))) { result.set(sha, await restPullRequests(api, sha)); continue; }
       result.set(sha, prs.nodes.map(restShape));
     }
   }
