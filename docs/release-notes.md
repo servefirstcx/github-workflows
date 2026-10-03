@@ -76,7 +76,7 @@ Mentions anywhere else never count: PR titles, "Depends on SF-9", "Follow-up to 
 
 ### What is sent, and when
 
-Only on a **successful production** deploy, the action rebuilds the list from GitHub at deploy time. Each commit is matched to its PR with GitHub's commit-to-PR lookup, so merge, squash and rebase merges all work. Editing the generated notes block does not change which tickets are reported.
+Only on a **successful production** deploy, the action rebuilds the list from GitHub at deploy time. Each commit is matched to its PR with GitHub's commit-to-PR lookup, so merge, squash and rebase merges all work. Lookups are batched 100 commits per GraphQL request (a typical release takes about 10 API calls in total), and the default job token is enough. Editing the generated notes block does not change which tickets are reported.
 
 - **Range:** from the previous successful production deployment recorded in GitHub to the deployed commit. A release that merged but never deployed is then still reported by the next deploy that ships it. If there is no earlier production deployment at all, only this release PR's changes are reported, with a warning. If deployments can't be read (the job lacks `deployments: read`), nothing is sent and the step fails so it is visible.
 - **Reverts:** a revert never reports a ticket, and every ticket on what it reverts is left out, even if another change also closes it. A revert of a revert also leaves the ticket out. When unsure, a ticket is left out rather than closed; move those by hand.

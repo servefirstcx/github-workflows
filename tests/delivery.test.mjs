@@ -24,6 +24,37 @@ test('strict notes parser preserves human Markdown with provenance', () => {
 });
 
 const pr = (body = notes()) => ({number: 7, title: 'Release 1.2', body, merged: true, merge_commit_sha: MERGE, head: {sha: HEAD}, base: {ref: 'main', sha: MERGE}, labels: [{name: 'release'}], html_url: 'https://github.com/org/repo/pull/7'});
+// Answers the batched associatedPullRequests GraphQL query from the same
+// `GET /commits/{sha}/pulls` routes the REST fallback uses, so one fixture covers both.
+function graphqlFromRest(routes, {query, variables}) {
+  if (routes['POST /graphql']) {
+    const value = typeof routes['POST /graphql'] === 'function' ? routes['POST /graphql']({query, variables}) : routes['POST /graphql'];
+    const [status, data] = Array.isArray(value) ? value : [200, value];
+    return new Response(JSON.stringify(data), {status});
+  }
+  assert.equal(variables.owner, 'org'); assert.equal(variables.name, 'repo');
+  const repository = {};
+  for (const [alias, sha] of Object.entries(variables).filter(([k]) => /^c\d+$/.test(k))) {
+    assert.match(query, new RegExp(`${alias}: object\\(oid: \\$${alias}\\)`));
+    const first = routes[`GET /commits/${sha}/pulls?per_page=100&page=1`];
+    assert.ok(first, `Unexpected GraphQL commit ${sha}`);
+    const pages = [];
+    for (let page = 1; routes[`GET /commits/${sha}/pulls?per_page=100&page=${page}`]; page++) {
+      const value = routes[`GET /commits/${sha}/pulls?per_page=100&page=${page}`];
+      const [status, list] = Array.isArray(value) && typeof value[0] === 'number' ? value : [200, value];
+      if (status !== 200) return new Response(JSON.stringify({}), {status});
+      pages.push(...list);
+      if (list.length < 100) break;
+    }
+    const nodes = pages.map(p => ({number: p.number, title: p.title, body: p.body, mergedAt: p.merged_at || null,
+      mergeCommit: p.merge_commit_sha ? {oid: p.merge_commit_sha} : null,
+      baseRefName: p.base?.ref, baseRepository: p.base?.repo ? {nameWithOwner: p.base.repo.full_name} : null,
+      headRefName: p.head?.ref, headRepository: p.head?.repo ? {nameWithOwner: p.head.repo.full_name} : null}));
+    repository[alias] = {associatedPullRequests: {totalCount: nodes.length, nodes: nodes.slice(0, 100)}};
+  }
+  return new Response(JSON.stringify({data: {repository}}), {status: 200});
+}
+
 function apiFixture(overrides = {}) {
   const calls = [];
   let release;
@@ -43,6 +74,7 @@ function apiFixture(overrides = {}) {
     const key = `${init.method || 'GET'} ${path}`;
     const body = init.body && JSON.parse(init.body);
     calls.push({key, body, init});
+    if (key === 'POST /graphql') return graphqlFromRest(routes, body);
     assert.ok(key in routes, `Unexpected request ${key}`);
     const value = typeof routes[key] === 'function' ? routes[key](body) : routes[key];
     const [status, data] = Array.isArray(value) ? value : [200, value];
@@ -289,6 +321,8 @@ const repoPr = (number, ref, extra = {}) => ({number, title: `Change ${number}`,
 const commit = (s, message) => ({sha: s, commit: {message}});
 const SECRET_BLOCK = '<!-- sf-release-notes:start -->\nCloses SF-99\n<!-- sf-release-notes:end -->';
 /** A release range: each commit lists the PRs GitHub associates with it. */
+const releasePrFor = () => ({...pr(), merged_at: '2026-01-02T00:00:00Z', head: {sha: HEAD, ref: 'release/1.2', repo: {full_name: 'org/repo'}}, base: {ref: 'main', repo: {full_name: 'org/repo'}}, body: 'Closes SF-6'});
+
 function releaseFixture({deployments = [200, [{id: 1, sha: MERGE}, {id: 2, sha: PREV}]], compare = 'ahead', extra = {}, range} = {}) {
   const release = {...pr(), merged_at: '2026-01-02T00:00:00Z', head: {sha: HEAD, ref: 'release/1.2', repo: {full_name: 'org/repo'}}, base: {ref: 'main', repo: {full_name: 'org/repo'}}, body: `Closes SF-6\n${SECRET_BLOCK}`};
   const p = {
@@ -475,6 +509,37 @@ test('released tickets: redeploying an already deployed commit reports nothing; 
     'GET /deployments/3/statuses?per_page=100&page=1': [200, [{state: 'failure'}]],
   }});
   assert.ok((await d.releasedTickets({...deployOptions, fetch: retried.fetch})).tickets.includes('SF-1'));
+});
+
+test('released tickets: commits are matched to PRs 100 at a time over GraphQL, not one REST call each', async () => {
+  const many = Array.from({length: 150}, (_, i) => [commit(sha(5000 + i), `change ${i}\n\nCloses SF-${1000 + i}`), [repoPr(500 + i, `SF-${2000 + i}-x`, {merge_commit_sha: sha(5000 + i)})]]);
+  const range = [...many, [commit(MERGE, 'Merge pull request #7 from org/release/1.2'), [releasePrFor()]]];
+  const fixture = releaseFixture({range});
+  const result = await d.releasedTickets({...deployOptions, fetch: fixture.fetch});
+  assert.equal(result.tickets.length, 301); // 150 Closes + 150 branch keys + SF-6 on the release PR
+  assert.equal(fixture.calls.filter(c => c.key === 'POST /graphql').length, 2);
+  assert.equal(fixture.calls.filter(c => /^GET \/commits\/[a-f0-9]{40}\/pulls/.test(c.key) && !c.key.includes(MERGE)).length, 0);
+  assert.equal(fixture.calls[fixture.calls.findIndex(c => c.key === 'POST /graphql')].init.headers.Authorization, 'Bearer secret');
+});
+
+test('released tickets: a commit in more than 100 PRs falls back to paginated REST', async () => {
+  const crowded = Array.from({length: 100}, (_, i) => ({number: 900 + i, merged_at: null}));
+  const range = [[commit(sha(6000), 'busy commit'), [...crowded, repoPr(42, 'SF-42-busy', {merge_commit_sha: sha(6000)})]],
+    [commit(MERGE, 'Merge pull request #7 from org/release/1.2'), [releasePrFor()]]];
+  const fixture = releaseFixture({range, extra: {
+    [`GET /commits/${sha(6000)}/pulls?per_page=100&page=1`]: [200, crowded],
+    [`GET /commits/${sha(6000)}/pulls?per_page=100&page=2`]: [200, [repoPr(42, 'SF-42-busy', {merge_commit_sha: sha(6000)})]],
+  }});
+  const result = await d.releasedTickets({...deployOptions, fetch: fixture.fetch});
+  assert.ok(result.tickets.includes('SF-42'));
+  assert.ok(fixture.calls.some(c => c.key.endsWith(`${sha(6000)}/pulls?per_page=100&page=2`)));
+});
+
+test('released tickets: GraphQL errors or a missing commit fail closed', async () => {
+  for (const reply of [[200, {errors: [{message: 'rate limited'}]}], [200, {data: {repository: {}}}], [502, {}]]) {
+    const fixture = releaseFixture({extra: {'POST /graphql': reply}});
+    await assert.rejects(d.releasedTickets({...deployOptions, fetch: fixture.fetch}), /GitHub|associated pull request/);
+  }
 });
 
 test('released tickets: long deployment history is fine when the previous deploy is near the top', async () => {

@@ -36,7 +36,8 @@ const REVERTS_COMMIT = /\bThis reverts commit ([a-f0-9]{40})\b/gi;
  * from the editable notes text. Range: the previous successful production
  * deployment to the deployed commit, so a release that merged but never deployed
  * is still reported by the next one. Every commit in the range is matched to its
- * merged PR with GitHub's commit-to-PR lookup (merge, squash and rebase merges).
+ * merged PR with GitHub's commit-to-PR lookup (merge, squash and rebase merges),
+ * batched 100 commits per GraphQL request.
  * Ticket rule (shippedTicketKeys): branch name, or a "Closes KEY" line in the PR
  * description or a commit message. Anything touched by a revert is left out.
  * When the range cannot be established, nothing is reported.
@@ -57,19 +58,14 @@ export async function releasedTickets(options) {
   // Release/hotfix PRs into main. A hotfix/SF-1-x branch merged into stage is an ordinary PR.
   const isRelease = pr => pr.head?.repo?.full_name === repository && pr.base?.ref === mainBranch && /^(?:release|hotfix)\//.test(pr.head?.ref || '');
   const prs = new Map(), prsOf = new Map(), releases = new Map([[release.number, release]]), releaseShas = new Map(), syncCommits = new Set();
-  for (const sha of messages.keys()) {
+  const associated = await associatedPullRequests(api, [...messages.keys()]);
+  for (const [sha, list] of associated) {
     const found = new Set();
-    for (let page = 1; ; page++) {
-      requireValue(page <= 10, 'Too many pull requests for one commit');
-      const list = await api(`/commits/${sha}/pulls?per_page=100&page=${page}`);
-      requireValue(Array.isArray(list), 'Invalid associated pull request response');
-      for (const pr of list) {
-        if (!pr?.merged_at || !messages.has(pr.merge_commit_sha) || pr.base?.repo?.full_name !== repository || !Number.isSafeInteger(pr.number)) continue;
-        if (isRelease(pr)) { releases.set(pr.number, pr); releaseShas.set(pr.number, [...(releaseShas.get(pr.number) || []), sha]); continue; }
-        if (isSync(pr)) { if (pr.merge_commit_sha === sha) syncCommits.add(sha); continue; }
-        prs.set(pr.number, pr); found.add(pr.number);
-      }
-      if (list.length < 100) break;
+    for (const pr of list) {
+      if (!pr?.merged_at || !messages.has(pr.merge_commit_sha) || pr.base?.repo?.full_name !== repository || !Number.isSafeInteger(pr.number)) continue;
+      if (isRelease(pr)) { releases.set(pr.number, pr); releaseShas.set(pr.number, [...(releaseShas.get(pr.number) || []), sha]); continue; }
+      if (isSync(pr)) { if (pr.merge_commit_sha === sha) syncCommits.add(sha); continue; }
+      prs.set(pr.number, pr); found.add(pr.number);
     }
     prsOf.set(sha, found);
   }
@@ -135,6 +131,54 @@ export async function releasedTickets(options) {
     for (const key of shippedTicketKeys({branch: pr.head?.ref, body: String(pr.body || '').replace(NOTES_BLOCK, '')})) keys.add(key);
   }
   return {tickets: [...keys].filter(key => !dropped.has(key)).sort(), releasePr: release, warnings};
+}
+
+const GRAPHQL_BATCH = 100;
+const PR_FIELDS = 'number title body mergedAt mergeCommit { oid } baseRefName baseRepository { nameWithOwner } headRefName headRepository { nameWithOwner }';
+
+/**
+ * Merged-or-not PRs containing each commit, the same list as GET /commits/{sha}/pulls,
+ * but 100 commits per GraphQL request instead of one REST call each. A commit with
+ * more than 100 PRs falls back to paginated REST. Any missing commit or error fails closed.
+ */
+async function associatedPullRequests(api, shas) {
+  const [owner, name] = api.repository.split('/');
+  const result = new Map();
+  for (let start = 0; start < shas.length; start += GRAPHQL_BATCH) {
+    const batch = shas.slice(start, start + GRAPHQL_BATCH);
+    const query = `query($owner: String!, $name: String!, ${batch.map((_, i) => `$c${i}: GitObjectID!`).join(', ')}) {
+      repository(owner: $owner, name: $name) {
+        ${batch.map((_, i) => `c${i}: object(oid: $c${i}) { ... on Commit { associatedPullRequests(first: 100) { totalCount nodes { ${PR_FIELDS} } } } }`).join('\n        ')}
+      }
+    }`;
+    const data = await api.graphql(query, {owner, name, ...Object.fromEntries(batch.map((sha, i) => [`c${i}`, sha]))});
+    for (const [i, sha] of batch.entries()) {
+      const prs = data?.repository?.[`c${i}`]?.associatedPullRequests;
+      requireValue(prs && Number.isSafeInteger(prs.totalCount) && Array.isArray(prs.nodes), 'Invalid associated pull request response');
+      if (prs.totalCount > prs.nodes.length) { result.set(sha, await restPullRequests(api, sha)); continue; }
+      result.set(sha, prs.nodes.map(restShape));
+    }
+  }
+  return result;
+}
+
+/** GraphQL PR node in the REST shape the rest of this file reads. */
+function restShape(node) {
+  return {number: node?.number, title: node?.title, body: node?.body, merged_at: node?.mergedAt || null,
+    merge_commit_sha: node?.mergeCommit?.oid || null,
+    base: {ref: node?.baseRefName, repo: {full_name: node?.baseRepository?.nameWithOwner}},
+    head: {ref: node?.headRefName, repo: {full_name: node?.headRepository?.nameWithOwner}}};
+}
+
+async function restPullRequests(api, sha) {
+  const all = [];
+  for (let page = 1; ; page++) {
+    requireValue(page <= 10, 'Too many pull requests for one commit');
+    const list = await api(`/commits/${sha}/pulls?per_page=100&page=${page}`);
+    requireValue(Array.isArray(list), 'Invalid associated pull request response');
+    all.push(...list);
+    if (list.length < 100) return all;
+  }
 }
 
 /** Previous successful production deployment. Fails closed when it can't be read. */
@@ -230,11 +274,11 @@ export async function sendJiraRelease({webhook, secret, tickets = [], repository
 export function createGitHub({repository, token, fetch: fetchImpl = globalThis.fetch}) {
   requireValue(/^[\w.-]+\/[\w.-]+$/.test(repository || ''), 'GITHUB_REPOSITORY must be owner/repository');
   requireValue(typeof token === 'string' && token.length > 0, 'GH_TOKEN is required');
-  return async function request(path, {method = 'GET', body, missing = false} = {}) {
+  const send = async (url, {method = 'GET', body, missing = false, timeout = 15000} = {}) => {
     let response;
     try {
-      response = await fetchImpl(`https://api.github.com/repos/${repository}${path}`, {
-        method, redirect: 'error', signal: AbortSignal.timeout(15000),
+      response = await fetchImpl(url, {
+        method, redirect: 'error', signal: AbortSignal.timeout(timeout),
         headers: {Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', 'Content-Type': 'application/json'},
         ...(body === undefined ? {} : {body: JSON.stringify(body)}),
       });
@@ -247,6 +291,15 @@ export function createGitHub({repository, token, fetch: fetchImpl = globalThis.f
     }
     try { return await response.json(); } catch { throw new Error('GitHub returned invalid JSON'); }
   };
+  const request = (path, options) => send(`https://api.github.com/repos/${repository}${path}`, options);
+  request.repository = repository;
+  /** GraphQL returns HTTP 200 with an errors array on failure; treat that as a failure too. */
+  request.graphql = async (query, variables) => {
+    const result = await send('https://api.github.com/graphql', {method: 'POST', body: {query, variables}, timeout: 30000});
+    requireValue(!result?.errors?.length && result?.data, 'GitHub GraphQL request failed');
+    return result.data;
+  };
+  return request;
 }
 
 export async function resolveTag(api, tag) {
