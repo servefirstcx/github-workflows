@@ -133,7 +133,7 @@ jobs:
               "title": "🚑 Hotfix v${{ steps.new_version.outputs.version }}",
               "head": "hotfix/${{ steps.new_version.outputs.version }}",
               "base": "${{ inputs.main_branch }}",
-              "body": "## 🚑 Hotfix v${{ steps.new_version.outputs.version }}\n\nThis PR contains the **${{ inputs.version_type }}** hotfix version bump from `${{ steps.current_version.outputs.version }}` to `${{ steps.new_version.outputs.version }}`.\n\n### What happens next?\n1. **Tests will run automatically** on this PR\n2. **Review and approve** when tests pass\n3. **Merge the PR** to trigger:\n   - Automatic tagging as v${{ steps.new_version.outputs.version }}\n   - Production deployment\n   - Sync PR from main → stage\n\n---\n*This PR was automatically created by the hotfix workflow*"
+              "body": "## 🚑 Hotfix v${{ steps.new_version.outputs.version }}\n\nThis PR contains the **${{ inputs.version_type }}** hotfix version bump from `${{ steps.current_version.outputs.version }}` to `${{ steps.new_version.outputs.version }}`.\n\n### What happens next?\n1. **Tests will run automatically** on this PR\n2. **Review and approve** when tests pass\n3. **Name the tickets**: add a `Closes SF-<number>` line here (or in the fix commit) for each ticket this hotfix ships, so Jira marks it Done (In Production) after the deploy\n4. **Merge the PR** to trigger:\n   - Automatic tagging as v${{ steps.new_version.outputs.version }}\n   - Production deployment\n   - Sync PR from main → stage\n\n---\n*This PR was automatically created by the hotfix workflow*"
             }')
 
           PR_NUMBER=$(echo "$PR_RESPONSE" | grep -o '"number":[[:space:]]*[0-9]*' | head -1 | sed 's/.*:[[:space:]]*//')

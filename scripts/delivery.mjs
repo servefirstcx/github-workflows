@@ -1,3 +1,4 @@
+import {shippedTicketKeys} from './release-notes.mjs';
 const SHA = /^[a-f0-9]{40}$/;
 
 
@@ -21,6 +22,209 @@ export async function sendSlack({webhook, payload, fetch: fetchImpl = globalThis
 
 function requireValue(condition, message) {
   if (!condition) throw new Error(message);
+}
+
+// Current incoming-webhook endpoint only. The legacy automation.atlassian.com/pro/hooks
+// endpoint was retired by Atlassian on 30 May 2025, and the new one requires the secret.
+const JIRA_WEBHOOK = /^https:\/\/api-private\.atlassian\.com\/automation\/webhooks\/jira\/a\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+$/;
+const JIRA_BATCH = 50;
+const NOTES_BLOCK = /<!-- sf-release-notes:start -->[\s\S]*?<!-- sf-release-notes:end -->/g;
+const REVERTS_COMMIT = /\bThis reverts commit ([a-f0-9]{40})\b/gi;
+
+/**
+ * Jira tickets shipped by a verified production deploy, rebuilt from GitHub, not
+ * from the editable notes text. Range: the previous successful production
+ * deployment to the deployed commit, so a release that merged but never deployed
+ * is still reported by the next one. Every commit in the range is matched to its
+ * merged PR with GitHub's commit-to-PR lookup (merge, squash and rebase merges).
+ * Ticket rule (shippedTicketKeys): branch name, or a "Closes KEY" line in the PR
+ * description or a commit message. Anything touched by a revert is left out.
+ * When the range cannot be established, nothing is reported.
+ */
+export async function releasedTickets(options) {
+  const {repository, deployedSha, version, tagPrefix = 'v', mainBranch = 'main', releaseLabel = 'release', stagingBranch = 'stage'} = options;
+  const api = createGitHub(options);
+  requireValue(await resolveTag(api, tagName(version, tagPrefix)) === deployedSha, 'Tag does not match deployed SHA');
+  const release = await associatedReleasePR(api, deployedSha, mainBranch, releaseLabel);
+  requireValue(release, 'No unique merged release PR for deployed SHA');
+  const {base, warnings} = await reportingBase(api, deployedSha);
+  if (!base) return {tickets: [], releasePr: release, warnings};
+
+  const commits = await rangeCommits(api, base, deployedSha);
+  const messages = new Map(commits.map(c => [c.sha, c.commit?.message || '']));
+  // Internal main<->stage sync PRs only; a fork's own main branch is an ordinary PR.
+  const isSync = pr => pr.head?.repo?.full_name === repository && [mainBranch, stagingBranch].includes(pr.head?.ref) && [mainBranch, stagingBranch].includes(pr.base?.ref);
+  // Release/hotfix PRs into main. A hotfix/SF-1-x branch merged into stage is an ordinary PR.
+  const isRelease = pr => pr.head?.repo?.full_name === repository && pr.base?.ref === mainBranch && /^(?:release|hotfix)\//.test(pr.head?.ref || '');
+  const prs = new Map(), prsOf = new Map(), releases = new Map([[release.number, release]]), releaseShas = new Map(), syncCommits = new Set();
+  for (const sha of messages.keys()) {
+    const found = new Set();
+    for (let page = 1; ; page++) {
+      requireValue(page <= 10, 'Too many pull requests for one commit');
+      const list = await api(`/commits/${sha}/pulls?per_page=100&page=${page}`);
+      requireValue(Array.isArray(list), 'Invalid associated pull request response');
+      for (const pr of list) {
+        if (!pr?.merged_at || !messages.has(pr.merge_commit_sha) || pr.base?.repo?.full_name !== repository || !Number.isSafeInteger(pr.number)) continue;
+        if (isRelease(pr)) { releases.set(pr.number, pr); releaseShas.set(pr.number, [...(releaseShas.get(pr.number) || []), sha]); continue; }
+        if (isSync(pr)) { if (pr.merge_commit_sha === sha) syncCommits.add(sha); continue; }
+        prs.set(pr.number, pr); found.add(pr.number);
+      }
+      if (list.length < 100) break;
+    }
+    prsOf.set(sha, found);
+  }
+
+  // Reverts, at ticket level and on the safe side: a revert never ships a ticket,
+  // and every ticket on what it reverts is dropped, even if something else also
+  // closes it. (A revert of a revert also drops it; mark those tickets by hand.)
+  const changeKeys = sha => shippedTicketKeys({messages: [messages.get(sha)]});
+  // The generated notes block never counts, for adding or for dropping tickets.
+  const prKeys = pr => shippedTicketKeys({branch: pr.head?.ref, body: String(pr.body || '').replace(NOTES_BLOCK, ''),
+    messages: [...prsOf].filter(([, numbers]) => numbers.has(pr.number)).map(([sha]) => messages.get(sha))});
+  const isRevert = text => /^revert\b/i.test(text || '');
+  const dropped = new Set(), revertPrs = new Set(), revertCommits = new Set();
+  const droppedPrs = new Set();
+  const dropPr = number => {
+    if (droppedPrs.has(number)) return;
+    droppedPrs.add(number);
+    const pr = prs.get(number) || releases.get(number);
+    if (pr) for (const key of prKeys(pr)) dropped.add(key);
+    // A reverted hotfix takes everything it contained with it: its direct commits and the PRs merged into it.
+    if (!releases.has(number) || number === release.number) return;
+    for (const sha of releaseShas.get(number) || []) {
+      for (const key of changeKeys(sha)) dropped.add(key);
+      for (const inner of prsOf.get(sha) || []) dropPr(inner);
+      for (const [other, shas] of releaseShas) if (other !== release.number && shas.includes(sha)) dropPr(other);
+    }
+  };
+  const reverting = [...prs.values(), ...releases.values()].filter(pr => isRevert(pr.title) || /^revert-/.test(pr.head?.ref || ''));
+  for (const pr of reverting) {
+    revertPrs.add(pr.number);
+    for (const m of String(pr.body || '').replace(NOTES_BLOCK, '').matchAll(/\bReverts\s+(?:([\w.-]+\/[\w.-]+))?#(\d+)\b/gi)) {
+      if (!m[1] || m[1].toLowerCase() === repository.toLowerCase()) dropPr(Number(m[2]));
+    }
+  }
+  for (const [sha, message] of messages) {
+    const targets = [...message.matchAll(/\bThis reverts commit ([a-f0-9]{40})\b/gi)].map(m => m[1].toLowerCase());
+    if (!targets.length && !isRevert(message)) continue;
+    revertCommits.add(sha);
+    for (const number of prsOf.get(sha)) revertPrs.add(number);
+    for (const target of targets) {
+      if (!messages.has(target)) continue;
+      for (const key of changeKeys(target)) dropped.add(key);
+      for (const number of prsOf.get(target)) dropPr(number);
+      // A reverted hotfix merge, or a reverted commit inside a hotfix, drops that hotfix's tickets.
+      // Every commit belongs to the release PR being deployed, so a normal release/* PR is exempt,
+      // but a hotfix being deployed is not: part of its fix was undone.
+      for (const pr of releases.values()) {
+        const exempt = pr.number === release.number && !/^hotfix\//.test(pr.head?.ref || '');
+        if (!exempt && (pr.merge_commit_sha === target || releaseShas.get(pr.number)?.includes(target))) dropPr(pr.number);
+      }
+    }
+  }
+
+  const keys = new Set();
+  for (const pr of prs.values()) if (!revertPrs.has(pr.number)) for (const key of prKeys(pr)) keys.add(key);
+  for (const sha of messages.keys()) {
+    if (prsOf.get(sha).size || syncCommits.has(sha) || revertCommits.has(sha)) continue;
+    for (const key of changeKeys(sha)) keys.add(key); // Direct commits, e.g. a hotfix fix commit.
+  }
+  // "Closes KEY" in a release/hotfix PR description, outside the generated notes block.
+  for (const pr of releases.values()) {
+    if (revertPrs.has(pr.number)) continue;
+    for (const key of shippedTicketKeys({branch: pr.head?.ref, body: String(pr.body || '').replace(NOTES_BLOCK, '')})) keys.add(key);
+  }
+  return {tickets: [...keys].filter(key => !dropped.has(key)).sort(), releasePr: release, warnings};
+}
+
+/** Previous successful production deployment. Fails closed when it can't be read. */
+async function reportingBase(api, deployedSha) {
+  // Newest first. Candidates start after this deploy's own record, so reruns and replays look
+  // further back. Pages are read only until the answer is known.
+  const deployments = [];
+  let checked = 0, done = false;
+  const evaluate = async deployment => {
+    if (!SHA.test(deployment.sha || '') || !Number.isSafeInteger(deployment.id)) return null;
+    // A newer deploy marks older ones "inactive"; any success means it reached production.
+    let succeeded = false;
+    for (let page = 1; !succeeded; page++) {
+      requireValue(page <= 10, 'Too many deployment statuses; cannot establish the previous production deployment');
+      const statuses = await api(`/deployments/${deployment.id}/statuses?per_page=100&page=${page}`);
+      requireValue(Array.isArray(statuses), 'Invalid deployment statuses response');
+      succeeded = statuses.some(item => item?.state === 'success');
+      if (statuses.length < 100) break;
+    }
+    if (!succeeded) return null;
+    // An earlier successful deploy of this same commit: a redeploy, its tickets were already reported.
+    // (Rerunning only the notification job adds no deployment record, so that still resends.)
+    if (deployment.sha === deployedSha) return {base: null, warnings: ['This commit was already deployed to production; no tickets reported. Rerun only the notification job to resend.']};
+    const {status} = await api(`/compare/${deployment.sha}...${deployedSha}`);
+    if (status === 'ahead') return {base: deployment.sha, warnings: []};
+    if (status === 'behind' || status === 'identical') return {base: null, warnings: ['Deployed version is not newer than the previous production deployment (rollback or redeploy); no tickets reported.']};
+    return {base: null, warnings: ['Previous production deployment is not an ancestor of this one; no tickets reported. Mark them in Jira by hand.']};
+  };
+  for (let page = 1; !done; page++) {
+    requireValue(page <= 10, 'Too many production deployments; cannot establish the previous one');
+    let list;
+    try { list = await api(`/deployments?environment=production&per_page=100&page=${page}`); }
+    catch (error) {
+      if (error.status === 403 || error.status === 404) throw new Error('Cannot read production deployments; give the notification job deployments: read');
+      throw error;
+    }
+    requireValue(Array.isArray(list), 'Invalid deployments response');
+    deployments.push(...list);
+    done = list.length < 100;
+    const own = deployments.findIndex(deployment => deployment?.sha === deployedSha);
+    // Until this deploy's own record shows up, every record seen so far may be newer than it.
+    if (own < 0 && !done) continue;
+    for (checked = Math.max(checked, own + 1); checked < deployments.length; checked++) {
+      const result = await evaluate(deployments[checked]);
+      if (result) return result;
+    }
+  }
+  // First ever recorded production deploy: report only this release PR's own changes.
+  const parent = (await api(`/commits/${deployedSha}`)).parents?.[0]?.sha;
+  requireValue(SHA.test(parent || ''), 'Deployed commit has no parent');
+  return {base: parent, warnings: ['No earlier successful production deployment found; reporting this release PR only.']};
+}
+
+async function rangeCommits(api, base, head) {
+  const commits = [];
+  for (let page = 1; page <= 100; page++) {
+    const result = await api(`/compare/${base}...${head}?per_page=100&page=${page}`);
+    requireValue(Number.isSafeInteger(result.total_commits) && Array.isArray(result.commits), 'Invalid compare response');
+    commits.push(...result.commits);
+    if (commits.length >= result.total_commits || !result.commits.length) {
+      requireValue(commits.length === result.total_commits, 'Incomplete commit range');
+      return commits;
+    }
+  }
+  throw new Error('Commit range exceeded safe limit');
+}
+
+/**
+ * Posts released ticket keys to a Jira Automation incoming webhook whose trigger
+ * is "Issues provided in the webhook HTTP POST body". The Jira rule owns what
+ * happens next; this side holds no Jira user credential.
+ */
+export async function sendJiraRelease({webhook, secret, tickets = [], repository, version, notesUrl, fetch: fetchImpl = globalThis.fetch}) {
+  requireValue(typeof webhook === 'string' && JIRA_WEBHOOK.test(webhook), 'Invalid Jira automation webhook URL');
+  requireValue(typeof secret === 'string' && secret.length > 0 && !/[\x00-\x1f\x7f]/.test(secret), 'Jira automation webhook secret is required');
+  requireValue(Array.isArray(tickets) && tickets.every(key => /^[A-Z][A-Z0-9]+-\d+$/.test(key)), 'Invalid Jira ticket keys');
+  if (!tickets.length) return {sent: false, skipped: true, tickets: 0};
+  const headers = {'Content-Type': 'application/json', 'X-Automation-Webhook-Token': secret};
+  let sent = 0;
+  for (let index = 0; index < tickets.length; index += JIRA_BATCH) {
+    let response;
+    try {
+      response = await fetchImpl(webhook, {method: 'POST', redirect: 'error', signal: AbortSignal.timeout(15000), headers,
+        body: JSON.stringify({issues: tickets.slice(index, index + JIRA_BATCH), data: {repository, version, notesUrl: notesUrl || null}})});
+    } catch { throw new Error(`Jira delivery failed after ${sent} of ${tickets.length} ticket(s) (network, redirect or timeout); rerun the job to resend`); }
+    // Never log response bodies, URLs or the secret.
+    if (!response.ok) throw new Error(`Jira delivery failed after ${sent} of ${tickets.length} ticket(s) (HTTP ${response.status}); rerun the job to resend`);
+    sent += Math.min(JIRA_BATCH, tickets.length - index);
+  }
+  return {sent: true, skipped: false, tickets: tickets.length};
 }
 
 export function createGitHub({repository, token, fetch: fetchImpl = globalThis.fetch}) {
@@ -127,7 +331,7 @@ export async function prepareDeployment(options) {
       warnings.push('Release notes unavailable: exact deployed provenance could not be verified.');
     }
   }
-  return {payload: buildSlackPayload({...options, content, notesUrl}), notesAvailable, warnings};
+  return {payload: buildSlackPayload({...options, content, notesUrl}), notesAvailable, notesUrl, warnings};
 }
 
 function escapeSlack(text) {

@@ -43,7 +43,8 @@ test('inventory uses pinned git range, paginates associations, deduplicates and 
   };
   const inventory = await notes.collectInventory({ cwd: r.cwd, repository: 'acme/app', base: r.base, head: b, token: 'mock-token', fetchImpl });
   assert.deepEqual(inventory.items.map(i => i.id), ['pr:100', `commit:${direct}`, 'pr:101']);
-  assert.deepEqual(inventory.items[0].tickets.map(t => t.key), ['SF-4417', 'SF-4418']);
+  // Branch name counts; a bare mention in the description ("Also SF-4418") does not.
+  assert.deepEqual(inventory.items[0].tickets.map(t => t.key), ['SF-4417']);
   assert.equal(inventory.items[0].url, 'https://github.com/acme/app/pull/100');
   assert.ok(requests.some(url => url.endsWith('per_page=100&page=2')));
   assert.equal(inventory.base, r.base);
@@ -238,7 +239,7 @@ test('CLI writes only the marked block, requires NOTES_FILE, never uses GITHUB_T
 });
 
 test('malformed GitHub responses and API errors fail inventory, unsafe Jira config cannot inject links', async t => {
-  const r = repository(t), feature = r.commit('SF-1 Fix cache');
+  const r = repository(t), feature = r.commit('Fix cache\n\nCloses SF-1');
   const config = { cwd: r.cwd, repository: 'acme/app', base: r.base, head: feature, token: 'mock' };
   for (const fetchImpl of [async () => response({ message: 'private response' }, 403), async () => response({ items: [] }), async () => response([{}])]) {
     await assert.rejects(notes.collectInventory({ ...config, fetchImpl }), /GitHub|Remote/);
