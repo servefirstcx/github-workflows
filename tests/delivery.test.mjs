@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, {after} from 'node:test';
 import assert from 'node:assert/strict';
 import * as d from '../scripts/delivery.mjs';
 import {mkdtemp, readFile, writeFile, rm} from 'node:fs/promises';
@@ -26,8 +26,11 @@ test('strict notes parser preserves human Markdown with provenance', () => {
 const pr = (body = notes()) => ({number: 7, title: 'Release 1.2', body, merged: true, merge_commit_sha: MERGE, head: {sha: HEAD}, base: {ref: 'main', sha: MERGE}, labels: [{name: 'release'}], html_url: 'https://github.com/org/repo/pull/7'});
 // Answers the batched associatedPullRequests GraphQL query from the same
 // `GET /commits/{sha}/pulls` routes the REST fallback uses, so one fixture covers both.
-// "a b { c } d" -> {a: true, b: {c: true}, d: true}
+// "a b { c } d" -> {a: true, b: {c: true}, d: true}. Deliberately tiny: plain field names
+// and braces only. Aliases, directives, arguments or fragments fail the test outright,
+// so this fixture can never answer with a field real GraphQL would have renamed or omitted.
 function parseSelection(text) {
+  assert.match(text, /^[A-Za-z_{}\s]*$/, `Unsupported GraphQL selection syntax in fixture: ${text}`);
   const tokens = text.match(/[A-Za-z_]+|[{}]/g) || [];
   const read = () => {
     const out = {};
@@ -45,9 +48,16 @@ function pick(value, selection) {
   return Object.fromEntries(Object.entries(selection).filter(([k]) => k in value).map(([k, sub]) => [k, pick(value[k], sub)]));
 }
 
+// A fixture mistake inside a GraphQL reply would otherwise be swallowed by the production REST
+// fallback and look like a pass, so every one is recorded and fails the file in after().
+const FIXTURE_ERRORS = [];
+after(() => assert.deepEqual(FIXTURE_ERRORS, [], 'GraphQL fixture errors were hidden by the REST fallback'));
+
 function graphqlFromRest(routes, request) {
   const override = routes['POST /graphql'];
-  const value = override ? (typeof override === 'function' ? override(request) : override) : graphqlData(routes, request);
+  let value;
+  try { value = override ? (typeof override === 'function' ? override(request) : override) : graphqlData(routes, request); }
+  catch (error) { FIXTURE_ERRORS.push(error.message); throw error; }
   const [status, data] = Array.isArray(value) ? value : [200, value];
   return new Response(JSON.stringify(data), {status});
 }
@@ -594,6 +604,11 @@ test('released tickets: a PR from a deleted fork keeps its branch ticket and is 
     [commit(MERGE, 'Merge pull request #7 from org/release/1.2'), [releasePrFor()]]];
   const result = await d.releasedTickets({...deployOptions, fetch: releaseFixture({range}).fetch});
   assert.deepEqual(result.tickets, ['SF-6', 'SF-77']);
+});
+
+test('GraphQL fixture rejects aliases and directives instead of guessing', () => {
+  assert.deepEqual(parseSelection('number mergeCommit { oid } headRepository { nameWithOwner }'), {number: true, mergeCommit: {oid: true}, headRepository: {nameWithOwner: true}});
+  for (const text of ['mergeCommit { renamed: oid }', 'mergeCommit { oid @skip(if: true) }', 'number ...F']) assert.throws(() => parseSelection(text), /Unsupported GraphQL selection/);
 });
 
 test('released tickets: dropping a selected GraphQL field changes the result (fixture honours the query)', async () => {
