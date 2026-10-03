@@ -27,3 +27,5 @@ jobs:
           .github/workflows/tag-release.yml
           .github/workflows/refresh-release-notes.yml
           .github/workflows/release-tooling-tests.yml
+          .github/workflows/deploy-ecs.yml
+          .github/workflows/deploy-s3-cloudfront.yml

@@ -87,6 +87,12 @@ on:
       SLACK_WEBHOOK_URL_STAGING:
         description: "Slack webhook for staging notifications"
         required: false
+      JIRA_RELEASE_WEBHOOK_URL:
+        description: "Jira Automation incoming webhook; receives ticket keys shipped by a successful production deploy"
+        required: false
+      JIRA_RELEASE_WEBHOOK_SECRET:
+        description: "Secret for JIRA_RELEASE_WEBHOOK_URL"
+        required: false
 
 permissions:
   id-token: write
@@ -103,6 +109,8 @@ jobs:
       version: ${{ steps.version-check.outputs.version }}
       is_release: ${{ steps.version-check.outputs.is_release }}
       has_tag: ${{ steps.version-check.outputs.has_tag }}
+      deployed_sha: ${{ steps.deployed.outputs.sha }}
+      deployed_version: ${{ steps.deployed.outputs.version }}
     steps:
       - name: Set environment variables
         id: set-env
@@ -133,11 +141,30 @@ jobs:
           echo "branch=$BRANCH" >> $GITHUB_OUTPUT
           echo "aws_region=${{ inputs.aws_region }}" >> $GITHUB_OUTPUT
 
+          # Deploying the triggering branch: pin to the triggering commit, which is the
+          # commit GitHub records on the environment deployment. Another branch: its tip.
+          if [[ "$BRANCH" == "${{ github.ref_name }}" ]]; then
+            echo "checkout_ref=${{ github.sha }}" >> $GITHUB_OUTPUT
+          else
+            echo "checkout_ref=$BRANCH" >> $GITHUB_OUTPUT
+          fi
+
       - name: Checkout code for version check
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ steps.set-env.outputs.branch }}
+          ref: ${{ steps.set-env.outputs.checkout_ref }}
+
+      - name: Record deployed commit and version
+        id: deployed
+        run: |
+          # Resolved once here; build-and-deploy checks out exactly this commit.
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          VERSION=""
+          if [[ -f package.json ]]; then
+            VERSION=$(node -p "require('./package.json').version || ''" 2>/dev/null || true)
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Check version and tags
         id: version-check
@@ -208,7 +235,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.setup.outputs.branch }}
+          ref: ${{ needs.setup.outputs.deployed_sha }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -380,7 +407,7 @@ jobs:
             fi
           fi
           echo "- **Branch:** ${{ needs.setup.outputs.branch }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** ${{ needs.setup.outputs.deployed_sha }}" >> $GITHUB_STEP_SUMMARY
           echo "- **S3 Bucket:** ${{ secrets.S3_BUCKET_NAME }}" >> $GITHUB_STEP_SUMMARY
           echo "- **CloudFront:** ${{ secrets.CF_DISTRIBUTION_ID }}" >> $GITHUB_STEP_SUMMARY
           echo "- **AWS Region:** ${{ needs.setup.outputs.aws_region }}" >> $GITHUB_STEP_SUMMARY
@@ -391,16 +418,29 @@ jobs:
             echo "❌ **${{ needs.setup.outputs.environment }} deployment failed!**" >> $GITHUB_STEP_SUMMARY
           fi
 
+  # Separate least-privilege job: the deploy job keeps only id-token/contents. The caller
+  # must grant pull-requests: read and deployments: read (see docs/release-notes.md).
+  notify:
+    name: Notify ${{ needs.setup.outputs.environment }} deployment
+    needs: [setup, build-and-deploy]
+    if: always() && needs.setup.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      deployments: read
+    steps:
       - name: Send deployment notification
-        if: always()
-        uses: 8398a7/action-slack@v3
+        continue-on-error: true
+        uses: servefirstcx/github-workflows/.github/actions/deployment-notification@main
         with:
-          status: ${{ job.status }}
-          text: |
-            ${{ inputs.app_display_name || inputs.app_name }} Deployment: ${{ job.status }}
-            Environment: ${{ needs.setup.outputs.environment }}
-            ${{ needs.setup.outputs.version != 'unknown' && format('Version: {0}{1}', needs.setup.outputs.has_tag == 'true' && 'v' || '', needs.setup.outputs.version) || '' }} ${{ needs.setup.outputs.is_release == 'true' && '🎉' || '' }}
-            Branch: ${{ needs.setup.outputs.branch }}
-            Commit: ${{ github.sha }}
-        env:
-          SLACK_WEBHOOK_URL: ${{ needs.setup.outputs.environment == 'production' && secrets.SLACK_WEBHOOK_URL_PROD || secrets.SLACK_WEBHOOK_URL_STAGING }}
+          status: ${{ needs.build-and-deploy.result }}
+          environment: ${{ needs.setup.outputs.environment }}
+          version: ${{ needs.setup.outputs.deployed_version }}
+          deployed-sha: ${{ needs.setup.outputs.deployed_sha }}
+          main-branch: ${{ inputs.main_branch }}
+          webhook-url: ${{ needs.setup.outputs.environment == 'production' && secrets.SLACK_WEBHOOK_URL_PROD || secrets.SLACK_WEBHOOK_URL_STAGING }}
+          # Jira only for production deploys of the triggering commit: GitHub records that commit
+          # on the deployment, and the ticket range is computed from those records.
+          jira-webhook-url: ${{ needs.setup.outputs.environment == 'production' && needs.setup.outputs.deployed_sha == github.sha && secrets.JIRA_RELEASE_WEBHOOK_URL || '' }}
+          jira-webhook-secret: ${{ secrets.JIRA_RELEASE_WEBHOOK_SECRET }}

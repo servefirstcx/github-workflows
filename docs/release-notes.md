@@ -59,7 +59,19 @@ Capture `deployed` outputs from the actual checkout using `git rev-parse HEAD` a
 
 For a separate notification-only job, use `environment: { name: <target>, deployment: false }` to retain environment-scoped secrets without creating a misleading successful deployment record. Pass the actual setup/deployment job results through `needs`, not the notification job's own `job.status`. GitHub does not support `deployment: false` with custom deployment protection rules; check the target environments first.
 
-API and Console use separate notification jobs in the companion PRs. The shared ECS/S3 workflows are deliberately not switched automatically in this change, to avoid surprising other callers with new token permissions. They can adopt the same composite action separately.
+API and Console use separate notification jobs in the companion PRs. The shared `deploy-ecs.yml` and `deploy-s3-cloudfront.yml` workflows use the same pattern: a separate `notify` job with `contents: read`, `pull-requests: read` and `deployments: read`, fed by the actual deploy job's result, the commit resolved once in `setup` (and checked out by the deploy job) and that checkout's package.json version. Jira is reported only for production deploys of the triggering commit (`github.sha`), because GitHub records that commit on the environment deployment the ticket range is computed from; a manual deploy of another branch still notifies Slack but skips Jira.
+
+A called workflow cannot request more token permissions than its caller grants, and GitHub rejects the whole run at startup otherwise. Callers of the shared deploy workflows must therefore grant the two extra read permissions, for example:
+
+```yaml
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: read
+  deployments: read
+```
+
+Granting them before the shared change lands is harmless, so update callers (on every branch that deploys, including the production branch) first. `deploy-ecs.yml` callers use `secrets: inherit`, which already forwards the org secrets `JIRA_RELEASE_WEBHOOK_URL` and `JIRA_RELEASE_WEBHOOK_SECRET`; `deploy-s3-cloudfront.yml` declares them as optional secrets, so a caller that forwards secrets explicitly must add them.
 
 ## Marking Jira tickets as released
 
