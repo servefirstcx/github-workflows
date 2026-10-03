@@ -80,6 +80,31 @@ function graphqlFromRest(routes, request) {
 }
 
 function graphqlData(routes, {query, variables}) {
+  // The whole query must be exactly the supported shape: variables, repository(owner, name), one
+  // `cN: object(oid: $cN) { ... on Commit { associatedPullRequests(first: 100) { totalCount nodes {...} } } }`
+  // per commit, nothing else. Aliases, directives, a different page size or a renamed field
+  // anywhere fail here instead of being answered as if GitHub had accepted them.
+  const aliases = Object.keys(variables).filter(k => /^c\d+$/.test(k));
+  assert.deepEqual(Object.keys(variables).sort(), ['name', 'owner', ...aliases].sort(), 'Unexpected GraphQL variables');
+  const flat = query.replace(/\s+/g, ' ').trim();
+  const head = `query($owner: String!, $name: String!, ${aliases.map(a => `$${a}: GitObjectID!`).join(', ')}) { repository(owner: $owner, name: $name) { `;
+  assert.ok(flat.startsWith(head), `Unexpected GraphQL query head: ${flat.slice(0, 160)}`);
+  let rest = flat.slice(head.length);
+  for (const alias of aliases) {
+    const prefix = `${alias}: object(oid: $${alias}) { ... on Commit { associatedPullRequests(first: 100) { totalCount nodes { `;
+    assert.ok(rest.startsWith(prefix), `Unexpected GraphQL selection for ${alias}: ${rest.slice(0, 160)}`);
+    rest = rest.slice(prefix.length);
+    // Close of `nodes {`, by brace depth (the PR fields contain their own braces).
+    let depth = 1, end = 0;
+    for (; end < rest.length && depth; end++) { if (rest[end] === '{') depth++; else if (rest[end] === '}') depth--; }
+    assert.equal(depth, 0, `Unclosed GraphQL selection for ${alias}`);
+    parseSelection(rest.slice(0, end - 1)); // PR fields, checked against PR_SCHEMA
+    rest = rest.slice(end);
+    // associatedPullRequests, ... on Commit, object
+    assert.ok(rest.startsWith(' } } }'), `Unexpected GraphQL selection after nodes for ${alias}: ${rest.slice(0, 80)}`);
+    rest = rest.slice(' } } }'.length).trimStart();
+  }
+  assert.equal(rest, '} }', `Unexpected GraphQL query tail: ${rest.slice(0, 160)}`);
   assert.equal(variables.owner, 'org'); assert.equal(variables.name, 'repo');
   const repository = {};
   for (const [alias, sha] of Object.entries(variables).filter(([k]) => /^c\d+$/.test(k))) {
@@ -632,6 +657,24 @@ test('GraphQL fixture rejects aliases, directives, unknown fields and bare objec
   assert.deepEqual(parseSelection('number mergeCommit { oid } headRepository { nameWithOwner }'), {number: true, mergeCommit: {oid: true}, headRepository: {nameWithOwner: true}});
   for (const text of ['mergeCommit { renamed: oid }', 'mergeCommit { oid @skip(if: true) }', 'number ...F']) assert.throws(() => parseSelection(text), /Unsupported GraphQL selection/);
   for (const text of ['mergeCommit', 'baseRepository', 'headRepository', 'number { x }', 'mergeCommit { }', 'mergeCommit { id }', 'nope', 'number }', 'mergeCommit { oid']) assert.throws(() => parseSelection(text), /GraphQL|selection|field/, text);
+});
+
+test('GraphQL fixture rejects any change to the query shape outside the PR fields', () => {
+  const routes = {[`GET /commits/${sha(1)}/pulls?per_page=100&page=1`]: [200, []]};
+  const vars = {owner: 'org', name: 'repo', c0: sha(1)};
+  const good = `query($owner: String!, $name: String!, $c0: GitObjectID!) {
+      repository(owner: $owner, name: $name) {
+        c0: object(oid: $c0) { ... on Commit { associatedPullRequests(first: 100) { totalCount nodes { number mergeCommit { oid } } } } }
+      }
+    }`;
+  assert.deepEqual(graphqlData(routes, {query: good, variables: vars}), {data: {repository: {c0: {associatedPullRequests: {totalCount: 0, nodes: []}}}}});
+  for (const [from, to] of [['totalCount ', ''], ['totalCount', 'count: totalCount'], ['nodes {', 'renamed: nodes {'],
+    ['associatedPullRequests(', 'prs: associatedPullRequests('], ['(first: 100)', '(first: 100) @skip(if: true)'],
+    ['repository(owner: $owner, name: $name)', 'repository(owner: $owner, name: $name) @skip(if: true)'], ['first: 100', 'first: 1'],
+    ['c0: object', 'x0: object'], ['... on Commit', '... on Tree']]) {
+    assert.throws(() => graphqlData(routes, {query: good.replace(from, to), variables: vars}), /GraphQL/, `${from} -> ${to}`);
+  }
+  assert.throws(() => graphqlData(routes, {query: good, variables: {...vars, extra: 1}}), /variables/);
 });
 
 test('released tickets: dropping a selected GraphQL field changes the result (fixture honours the query)', async () => {
