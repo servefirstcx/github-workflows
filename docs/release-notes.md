@@ -80,7 +80,7 @@ Only on a **successful production** deploy, the action rebuilds the list from Gi
 
 - **Range:** from the previous successful production deployment recorded in GitHub to the deployed commit. A release that merged but never deployed is then still reported by the next deploy that ships it. If there is no earlier production deployment at all, only this release PR's changes are reported, with a warning. If deployments can't be read (the job lacks `deployments: read`), nothing is sent and the step fails so it is visible.
 - **Reverts:** a revert never reports a ticket, and every ticket on what it reverts is left out, even if another change also closes it. A revert of a revert also leaves the ticket out. When unsure, a ticket is left out rather than closed; move those by hand.
-- **Rollbacks:** deploying an older or the same version as the previous production deploy reports nothing, and so does a deploy whose history doesn't include the previous one.
+- **Rollbacks and redeploys:** deploying an older version, or a commit that already reached production, reports nothing, and so does a deploy whose history doesn't include the previous one.
 - **Payload:** ticket keys in batches of 50:
 
 ```json
@@ -114,7 +114,7 @@ Store the URL and secret as Actions secrets **`JIRA_RELEASE_WEBHOOK_URL`** and *
 
 ### Failures and reruns
 
-Slack and Jira are independent: either can be configured alone, and a failure in one does not skip the other. Either failure still fails the (non-blocking) notification step so it is visible. If a batch fails, the error says how many tickets were already sent. Rerunning the job resends all of them, and the Dev Complete condition skips tickets that already moved. A ticket moved back to Dev Complete after release can be moved again by a rerun of that deploy.
+Slack and Jira are independent: either can be configured alone, and a failure in one does not skip the other. Either failure still fails the (non-blocking) notification step so it is visible. If a batch fails, the error says how many tickets were already sent. Rerunning only the failed notification job resends all of them, and the Dev Complete condition skips tickets that already moved. Redeploying the same commit (a new deployment) reports nothing, because that commit already reached production.
 
 Atlassian's endpoint can return HTTP 200 even when the secret is wrong or the rule is disabled, so the log says "webhook returned success", not "updated". Check the rule's audit log after the first real deploy.
 

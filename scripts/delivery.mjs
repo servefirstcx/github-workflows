@@ -144,7 +144,7 @@ async function reportingBase(api, deployedSha) {
   const deployments = [];
   let checked = 0, done = false;
   const evaluate = async deployment => {
-    if (deployment.sha === deployedSha || !SHA.test(deployment.sha || '') || !Number.isSafeInteger(deployment.id)) return null;
+    if (!SHA.test(deployment.sha || '') || !Number.isSafeInteger(deployment.id)) return null;
     // A newer deploy marks older ones "inactive"; any success means it reached production.
     let succeeded = false;
     for (let page = 1; !succeeded; page++) {
@@ -155,6 +155,9 @@ async function reportingBase(api, deployedSha) {
       if (statuses.length < 100) break;
     }
     if (!succeeded) return null;
+    // An earlier successful deploy of this same commit: a redeploy, its tickets were already reported.
+    // (Rerunning only the notification job adds no deployment record, so that still resends.)
+    if (deployment.sha === deployedSha) return {base: null, warnings: ['This commit was already deployed to production; no tickets reported. Rerun only the notification job to resend.']};
     const {status} = await api(`/compare/${deployment.sha}...${deployedSha}`);
     if (status === 'ahead') return {base: deployment.sha, warnings: []};
     if (status === 'behind' || status === 'identical') return {base: null, warnings: ['Deployed version is not newer than the previous production deployment (rollback or redeploy); no tickets reported.']};

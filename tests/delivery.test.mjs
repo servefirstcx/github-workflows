@@ -464,6 +464,19 @@ test('released tickets: a deployed hotfix whose fix was reverted reports nothing
   assert.deepEqual(kept.tickets, ['SF-78']);
 });
 
+test('released tickets: redeploying an already deployed commit reports nothing; a failed earlier attempt does not count', async () => {
+  const redeploy = releaseFixture({deployments: [200, [{id: 1, sha: MERGE}, {id: 3, sha: MERGE}, {id: 2, sha: PREV}]], extra: {
+    'GET /deployments/3/statuses?per_page=100&page=1': [200, [{state: 'inactive'}, {state: 'success'}]],
+  }});
+  const result = await d.releasedTickets({...deployOptions, fetch: redeploy.fetch});
+  assert.deepEqual(result.tickets, []);
+  assert.match(result.warnings[0], /already deployed/);
+  const retried = releaseFixture({deployments: [200, [{id: 1, sha: MERGE}, {id: 3, sha: MERGE}, {id: 2, sha: PREV}]], extra: {
+    'GET /deployments/3/statuses?per_page=100&page=1': [200, [{state: 'failure'}]],
+  }});
+  assert.ok((await d.releasedTickets({...deployOptions, fetch: retried.fetch})).tickets.includes('SF-1'));
+});
+
 test('released tickets: long deployment history is fine when the previous deploy is near the top', async () => {
   const full = [{id: 1, sha: MERGE}, {id: 2, sha: PREV}, ...Array.from({length: 98}, (_, i) => ({id: 1000 + i, sha: sha(7000 + i)}))];
   const fixture = releaseFixture({deployments: [200, full]});
