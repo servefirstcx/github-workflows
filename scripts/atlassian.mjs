@@ -75,10 +75,17 @@ async function jiraIssues(api, keys) {
         nextPageToken = result.nextPageToken;
       }
     } catch (error) {
-      // JQL rejects the whole query when one key doesn't exist or isn't visible: look each one up instead.
+      // JQL rejects the whole query when one key doesn't exist or isn't visible: search each key on its own.
+      // Same endpoint and scopes as the batch, so the token needs nothing extra; a 400 means not found.
       if (error.status !== 400) throw error;
       issues.length = 0;
-      for (const key of batch) issues.push(await api.jira('read issue', `/issue/${key}?fields=${FIELDS}`, {missing: true}));
+      for (const key of batch) {
+        try {
+          const result = await api.jira('search issue', '/search/jql', {method: 'POST', body: {jql: `key in ("${key}")`, fields: FIELDS.split(','), maxResults: 1}});
+          requireValue(Array.isArray(result?.issues), 'Jira: invalid search response');
+          issues.push(...result.issues);
+        } catch (inner) { if (inner.status !== 400) throw inner; }
+      }
     }
     // A moved issue comes back under its new key; only exact keys count.
     for (const issue of issues) {

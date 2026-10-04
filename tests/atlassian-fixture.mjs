@@ -77,7 +77,6 @@ export function atlassianFake({pages = [{id: '1', title: 'Release notes', parent
       if (strictJql && keys.some(key => !state.issues[key])) return [400, {errorMessages: ["An issue with key 'X' does not exist for field 'key'."]}];
       return {issues: keys.filter(key => state.issues[key]).map(issueJson), isLast: true};
     }
-    if ((m = key.match(/^GET jira\/issue\/([A-Z][A-Z0-9]+-\d+)\?fields=summary,issuetype,status,fixVersions$/))) return state.issues[m[1]] ? issueJson(m[1]) : [404, {errorMessages: ['Issue does not exist']}];
     if ((m = key.match(/^PUT jira\/issue\/([A-Z][A-Z0-9]+-\d+)\?notifyUsers=false$/))) {
       const issue = state.issues[m[1]];
       if (!issue) return [404, {}];

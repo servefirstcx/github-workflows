@@ -101,11 +101,12 @@ test('a concurrent run that creates the pages or version first is reused, not du
   assert.equal(fake.state.versions[0].released, true);
 });
 
-test('a key Jira search rejects falls back to per-ticket reads with the same result', async () => {
+test('a key Jira search rejects falls back to one search per key (no extra token scopes) with the same result', async () => {
   const strict = atlassianFake({issues: issues(), strictJql: true}), lenient = atlassianFake({issues: issues()});
   const result = await a.publishAtlassianRelease(options(strict));
   await a.publishAtlassianRelease(options(lenient));
-  assert.ok(strict.calls.some(call => call.key === 'GET jira/issue/SF-404?fields=summary,issuetype,status,fixVersions'));
+  assert.ok(strict.calls.some(call => call.key === 'POST jira/search/jql' && call.body?.jql === 'key in ("SF-404")'));
+  assert.ok(!strict.calls.some(call => call.key.startsWith('GET jira/issue/')), 'GET /issue needs scopes the token lacks');
   assert.equal(page(strict, 'sf-api 4.26.0').body, page(lenient, 'sf-api 4.26.0').body);
   assert.deepEqual(result.fixVersions, {added: 2, already: 0, skipped: 2});
 });

@@ -172,16 +172,18 @@ Use a dedicated account, not a person's, and create the root page **Release note
 - **Jira, project `SF`:** *Administer Projects*. Jira requires this, or *Administer Jira*, to create and update versions. Without it, Jira also ignores `notifyUsers=false` and watchers get an email for every fix-version edit. The account also needs *Browse Projects* and *Edit Issues*, which the project admin role normally has (check the permission scheme), and must be able to see the tickets if issue security is used.
 - **Confluence, space `Eng`:** view the space and add pages, which covers editing the pages it creates and their labels. If the **Release notes** page has restrictions, add the account to them.
 
-Requests use HTTP Basic auth (account email and API token) through the `api.atlassian.com/ex/{jira|confluence}/{cloudId}` gateway, so scoped API tokens work. The cloud ID defaults to ServeFirst's site (`atlassian-cloud-id`). Recommended scopes:
+Requests use HTTP Basic auth (account email and API token) through the `api.atlassian.com/ex/{jira|confluence}/{cloudId}` gateway, so scoped API tokens work. The cloud ID defaults to ServeFirst's site (`atlassian-cloud-id`).
 
-- **Jira token**, classic scopes (recommended): `read:jira-work`, `write:jira-work`, `manage:jira-project`. The API reference lists `manage:jira-project` for creating and updating versions. The granular equivalent is long and marked beta: `read:project-version:jira`, `write:project-version:jira`, `write:issue:jira`, `read:issue-details:jira`, `read:issue:jira`, `read:project:jira`, `read:field:jira`, `read:field.default-value:jira`, `read:field.option:jira`, `read:group:jira`, `read:issue-meta:jira`, `read:issue-security-level:jira`, `read:issue.vote:jira`, `read:issue.changelog:jira`, `read:avatar:jira`, `read:status:jira`, `read:user:jira`, `read:field-configuration:jira`, `read:issue-type:jira`, `read:project.property:jira`, `read:application-role:jira`, `read:issue-type-hierarchy:jira`, `read:project-category:jira`, `read:project.component:jira`.
-- **Confluence token**, granular scopes (the v2 page and space APIs have no classic scope): `read:space:confluence`, `read:page:confluence`, `write:page:confluence`, `read:label:confluence`, `write:label:confluence`. The label endpoint (v1) also accepts the classic `write:confluence-content`.
+**ServeFirst setup:** the **Release bot** service account (Atlassian Administration → Directory → Service accounts) is in SF's *Administrators* project role (not a site-wide admin), and can view, add and edit pages in the Engineering space. Its API token (`github-release-publisher`, expires 2027-10-03) covers both apps with exactly these 25 granular scopes. Service-account tokens offer granular scopes only:
 
-These scopes come from Atlassian's API reference and haven't been tested against a live token yet. Check them on the first deploy.
+- **Jira (20):** `read:project:jira`, `read:project.property:jira`, `read:project.component:jira`, `read:project-category:jira`, `read:project-version:jira`, `write:project-version:jira`, `read:issue-type:jira`, `read:issue-type-hierarchy:jira`, `read:user:jira`, `read:application-role:jira`, `read:avatar:jira`, `read:group:jira`, `read:issue-details:jira`, `read:issue-meta:jira`, `read:audit-log:jira`, `read:field:jira`, `read:field.default-value:jira`, `read:field.option:jira`, `read:field-configuration:jira`, `write:issue:jira`.
+- **Confluence (5):** `read:space:confluence`, `read:page:confluence`, `write:page:confluence`, `read:label:confluence`, `write:label:confluence`.
 
-A scoped token is created for one app (Jira or Confluence). Create one token per app and pass the Confluence one as `atlassian-confluence-api-token`. Without that input, the Jira token is used for both, which works for an unscoped token. Tokens expire after at most a year, so note the renewal date.
+They are the union of the `x-atlassian-oauth2-scopes` for exactly the endpoints this code calls: get project; get, create and update versions; `POST /search/jql`; edit issue; v2 spaces and pages; and the v1 add-label endpoint. **Any new endpoint must be checked against this list.** For example, `GET /issue/{key}` needs five more scopes, which is why missing keys are searched one at a time instead. Rotate the token before it expires.
 
-Store them as organisation secrets visible to the application repositories: **`ATLASSIAN_RELEASE_EMAIL`**, **`ATLASSIAN_RELEASE_TOKEN`** (Jira, or both) and, for scoped tokens, **`ATLASSIAN_RELEASE_CONFLUENCE_TOKEN`**.
+`atlassian-confluence-api-token` is only needed if Jira and Confluence use separate tokens. ServeFirst's single token covers both, so leave it unset.
+
+Store them as organisation secrets visible to the application repositories: **`ATLASSIAN_RELEASE_EMAIL`**, **`ATLASSIAN_RELEASE_TOKEN`** (both already set at org level), plus **`ATLASSIAN_RELEASE_CONFLUENCE_TOKEN`** only if you split tokens per app.
 
 ### Wiring a repository
 
