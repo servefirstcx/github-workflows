@@ -51,7 +51,7 @@ export async function releasedTickets(options) {
   const release = await associatedReleasePR(api, deployedSha, mainBranch, releaseLabel);
   requireValue(release, 'No unique merged release PR for deployed SHA');
   const {base, previous = null, deployedAt, warnings} = await reportingBase(api, deployedSha);
-  if (!base) return {tickets: [], pullRequests: [], reverted: {pullRequests: [], tickets: []}, releasePr: release, base: null, previous: null, deployedAt, warnings};
+  if (!base) return {tickets: [], pullRequests: [], directCommits: [], reverted: {pullRequests: [], tickets: []}, releasePr: release, base: null, previous: null, deployedAt, warnings};
 
   const commits = await rangeCommits(api, base, deployedSha);
   const messages = new Map(commits.map(c => [c.sha, c.commit?.message || '']));
@@ -135,7 +135,14 @@ export async function releasedTickets(options) {
   const tickets = [...keys].filter(key => !dropped.has(key)).sort(), shipped = new Set(tickets);
   const facts = (list, keysOf) => list.sort((a, b) => a.number - b.number).map(pr => ({number: pr.number, title: String(pr.title || ''), author: pr.user?.login || null, mergedAt: pr.merged_at, tickets: keysOf(pr)}));
   const left = pr => revertPrs.has(pr.number) || droppedPrs.has(pr.number);
-  return {tickets, releasePr: release, base, previous, deployedAt, warnings,
+  // Changes that reached production without a PR (e.g. a fix pushed straight to a hotfix branch).
+  // Version bumps, sync and release merges, other merge commits and reverts are bookkeeping, not changes.
+  const releaseMerges = new Set([...releases.values()].map(pr => pr.merge_commit_sha));
+  const directCommits = commits.filter(c => !prsOf.get(c.sha)?.size && !syncCommits.has(c.sha) && !revertCommits.has(c.sha) && !releaseMerges.has(c.sha)
+    && (c.parents?.length ?? 1) <= 1 && !/^chore: bump version\b/i.test(messages.get(c.sha)))
+    .map(c => ({sha: c.sha, title: messages.get(c.sha).split('\n')[0], author: c.author?.login || c.commit?.author?.name || null,
+      committedAt: c.commit?.committer?.date || null, tickets: changeKeys(c.sha).filter(key => shipped.has(key))}));
+  return {tickets, releasePr: release, base, previous, deployedAt, warnings, directCommits,
     pullRequests: facts([...prs.values()].filter(pr => !left(pr)), pr => prKeys(pr).filter(key => shipped.has(key))),
     reverted: {pullRequests: facts([...prs.values()].filter(left), prKeys).map(pr => ({...pr, reason: revertPrs.has(pr.number) ? 'revert' : 'reverted'})),
       tickets: [...keys].filter(key => dropped.has(key)).sort()}};

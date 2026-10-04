@@ -464,6 +464,9 @@ test('released tickets are rebuilt from GitHub since the last production deploy,
   // Not: SF-9/SF-8 (mentions), SF-3 (reverted), SF-90/SF-98 (sync PR), SF-97 (no "Closes"), SF-99 (inside the notes block).
   assert.deepEqual(result.tickets, ['SF-1', 'SF-10', 'SF-11', 'SF-2', 'SF-5', 'SF-6', 'SF-7']);
   assert.deepEqual(result.warnings, []);
+  // Only the hotfix fix commit reached production without a PR: version bumps, the release merge,
+  // sync/merge commits and PR commits are not "direct".
+  assert.deepEqual(result.directCommits.map(c => [c.sha, c.title, c.tickets]), [[sha(2000), 'hotfix: cap export cells', ['SF-5']]]);
   assert.ok(fixture.calls.every(c => c.init.redirect === 'error' && c.init.signal));
 });
 
@@ -867,6 +870,6 @@ test('notification CLI dry-run shows the Jira release and Confluence page it wou
     assert.match(body, /<h2>Tickets shipped \(7\)<\/h2>/);
     assert.match(body, /Not fetched \(dry run\)/);
   } finally { await rm(directory, {recursive: true, force: true}); }
-  assert.ok(logs.some(line => line.startsWith('Atlassian dry-run: would publish Confluence page "repo 1.2" (Eng › Release notes › repo release notes; labels release-notes, repo-repo) with 7 ticket(s), 3 PR(s) and 2 reverted PR(s) left out.')));
+  assert.ok(logs.some(line => line.startsWith('Atlassian dry-run: would publish Confluence page "repo 1.2" (Eng › Release notes › repo release notes; labels release-notes, repo-repo) with 7 ticket(s), 3 PR(s) (0 without a ticket), 1 direct commit(s) and 2 reverted PR(s) left out.')));
   assert.ok(logs.some(line => line === 'Atlassian dry-run: would release Jira version "repo 1.2" in SF dated 2026-10-03 and add it to 7 SF ticket(s) that exist: SF-1, SF-10, SF-11, SF-2, SF-5, SF-6, SF-7.'));
 });
