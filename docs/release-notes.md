@@ -142,7 +142,7 @@ Release notes                    existing root page, created by hand
 The version page holds only facts:
 
 - **Details:** repository, version, deployed at (UTC), deployed commit, release or hotfix PR, GitHub release, previous production commit and the compare range.
-- **Tickets shipped:** key, summary, type and status. Status is read when the page is written, so tickets the Jira rule hasn't moved yet still show Dev Complete. Keys Jira doesn't return are listed as "Not found in Jira".
+- **Tickets shipped:** key, summary and type. There's no status column: the Jira rule moves these tickets at the same moment, so a snapshot would be stale on arrival (check Jira for live status). Keys Jira doesn't return are listed as "Not found in Jira". Requests send `Accept-Language: en-US`, because without it the gateway returned translated issue-type names for the service account.
 - **Pull requests:** number, title, author, merged date and the shipped tickets each one closes. Sync PRs, release/hotfix PRs, reverts and reverted PRs are left out.
 - **Left out (reverted):** tickets and PRs left out because of reverts.
 

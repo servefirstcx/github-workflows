@@ -50,7 +50,7 @@ test('first publish creates repository page, version page, labels, released Jira
   for (const fact of ['<a href="https://github.com/servefirstcx/sf-api/commit/' + DEPLOYED + '">ccccccc</a>', '2026-10-03T10:15:00Z',
     '<a href="https://github.com/servefirstcx/sf-api/pull/7">#7</a> Release 4.26.0', '<a href="https://github.com/servefirstcx/sf-api/releases/tag/v4.26.0">',
     '<a href="https://github.com/servefirstcx/sf-api/commit/' + PREV + '">ddddddd</a>', `compare/${PREV}...${DEPLOYED}`,
-    '<td><a href="https://servefirst.atlassian.net/browse/SF-1">SF-1</a></td><td>Grid images lost</td><td>Bug</td><td>Dev Complete</td>',
+    '<td><a href="https://servefirst.atlassian.net/browse/SF-1">SF-1</a></td><td>Grid images lost</td><td>Bug</td>',
     '<td><a href="https://servefirst.atlassian.net/browse/SF-404">SF-404</a></td><td>Not found in Jira</td>',
     '<td>CSAT SMS step 1</td><td>unknown</td><td>2026-10-01</td>', '<h2>Left out (reverted)</h2>', '<td>revert</td>', '<td>reverted</td>',
     'Generated automatically from the production deploy. Facts only.']) assert.ok(version.body.includes(fact), fact);

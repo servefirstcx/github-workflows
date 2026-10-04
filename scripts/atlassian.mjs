@@ -38,7 +38,10 @@ export function createAtlassian({email, token, confluenceToken = token, cloudId 
   requireValue(validToken(token), 'ATLASSIAN_API_TOKEN is required');
   requireValue(validToken(confluenceToken), 'ATLASSIAN_CONFLUENCE_API_TOKEN is invalid');
   requireValue(CLOUD_ID.test(cloudId || ''), 'ATLASSIAN_CLOUD_ID must be an Atlassian cloud ID (UUID)');
-  const headers = secret => ({Authorization: `Basic ${Buffer.from(`${email}:${secret}`).toString('base64')}`, Accept: 'application/json', 'Content-Type': 'application/json'});
+  const headers = secret => ({Authorization: `Basic ${Buffer.from(`${email}:${secret}`).toString('base64')}`, Accept: 'application/json', 'Content-Type': 'application/json',
+    // Through the api.atlassian.com gateway, Jira translates built-in names (issue types) unless asked otherwise:
+    // the first real run rendered Story/Bug/Task in Chinese for the service account.
+    'Accept-Language': 'en-US'});
   const send = async (step, url, {method = 'GET', body, missing = false, secret = token} = {}) => {
     let response;
     try {
@@ -125,14 +128,15 @@ export function renderReleasePage({plan, deployedSha, deployedAt, notesUrl, rele
     ['Previous production commit', previous ? commit(previous) : 'None recorded (first production deploy; range is this release PR only)'],
     ['Range', link(`${gh}/compare/${base}...${deployedSha}`, `${base.slice(0, 7)}...${deployedSha.slice(0, 7)}`)],
   ];
-  const issue = key => issues === null ? ['Not fetched (dry run)', '', ''] : issues.has(key) ? [issues.get(key).summary, issues.get(key).type, issues.get(key).status] : ['Not found in Jira', '', ''];
+  // No status column: the Jira webhook moves these tickets at the same moment, so a snapshot is stale on arrival.
+  const issue = key => issues === null ? ['Not fetched (dry run)', ''] : issues.has(key) ? [issues.get(key).summary, issues.get(key).type] : ['Not found in Jira', ''];
   const pr = item => [pull(item.number), xml(item.title), xml(item.author || 'unknown'), xml(day(item.mergedAt)), keys(item.tickets || [])];
   const left = released.reverted || {pullRequests: [], tickets: []};
   return [
     '<h2>Details</h2>',
     `<table><tbody>${details.map(([name, value]) => `<tr><th>${xml(name)}</th><td>${value}</td></tr>`).join('')}</tbody></table>`,
     `<h2>Tickets shipped (${released.tickets.length})</h2>`,
-    released.tickets.length ? table(['Key', 'Summary', 'Type', 'Status'], released.tickets.map(key => [keys([key]), ...issue(key).map(xml)])) : '<p>No tickets.</p>',
+    released.tickets.length ? table(['Key', 'Summary', 'Type'], released.tickets.map(key => [keys([key]), ...issue(key).map(xml)])) : '<p>No tickets.</p>',
     `<h2>Pull requests (${released.pullRequests.length})</h2>`,
     released.pullRequests.length ? table(['PR', 'Title', 'Author', 'Merged (UTC)', 'Tickets'], released.pullRequests.map(pr)) : '<p>No pull requests.</p>',
     ...(left.pullRequests.length || left.tickets.length ? ['<h2>Left out (reverted)</h2>', `<p>Tickets left out: ${left.tickets.length ? keys(left.tickets) : 'none'}</p>`,
