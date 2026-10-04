@@ -577,6 +577,8 @@ test('released tickets: reverting a commit inside a hotfix drops the hotfix bran
   ];
   const result = await d.releasedTickets({...deployOptions, fetch: releaseFixture({range, extra: {'GET /pulls/7': release}}).fetch});
   assert.deepEqual(result.tickets, ['SF-6']);
+  // The reverted fix and its revert are not listed as shipped direct commits.
+  assert.deepEqual(result.directCommits, []);
 });
 
 test('released tickets: a deployed hotfix whose fix was reverted reports nothing', async () => {
@@ -588,8 +590,11 @@ test('released tickets: a deployed hotfix whose fix was reverted reports nothing
   ];
   const result = await d.releasedTickets({...deployOptions, fetch: releaseFixture({range, extra: {'GET /pulls/7': hotfix}}).fetch});
   assert.deepEqual(result.tickets, []);
+  assert.deepEqual(result.directCommits, [], 'Undone hotfix work is not listed as shipped');
   const kept = await d.releasedTickets({...deployOptions, fetch: releaseFixture({range: [range[0], range[2]], extra: {'GET /pulls/7': hotfix}}).fetch});
   assert.deepEqual(kept.tickets, ['SF-78']);
+  // A fix on hotfix/SF-78-… is covered by the branch ticket, so it isn't flagged as having no ticket.
+  assert.deepEqual(kept.directCommits.map(c => [c.sha, c.title, c.tickets]), [[sha(8101), 'neutral fix', ['SF-78']]]);
 });
 
 test('released tickets: redeploying an already deployed commit reports nothing; a failed earlier attempt does not count', async () => {
