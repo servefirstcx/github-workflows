@@ -2,11 +2,11 @@
 
 ## What changes
 
-Release PRs contain a short overview, followed by the actual included PRs and linked Jira tickets. The generated section is identified by `sf-release-notes` markers. GitHub Release publication copies this reviewed section; deployment notifications reuse it. Deployment never calls an AI model or reads from Jira.
+Release PRs contain a short overview, followed by the actual included PRs and linked Jira tickets. The generated section is identified by `sf-release-notes` markers. GitHub Release publication copies this reviewed section; deployment notifications reuse it. Deployment never calls an AI model. It reads Jira only to publish release facts (see [Jira releases and Confluence release notes](#jira-releases-and-confluence-release-notes)).
 
 The collector uses pinned production and release commits, not a date window or the latest stage branch. Missing AI/Jira credentials use a complete title/link fallback. Inventory collection failures are errors, not a falsely complete list. Model output cannot add/remove source items or supply links.
 
-The one Jira write is optional and happens after a successful production deploy: the deployment notification can report released ticket keys to a Jira Automation webhook (see [Marking Jira tickets as released](#marking-jira-tickets-as-released)).
+Jira and Confluence writes are optional and happen only after a successful production deploy: the deployment notification can report released ticket keys to a Jira Automation webhook (see [Marking Jira tickets as released](#marking-jira-tickets-as-released)), and publish the release's facts to a Jira release and a Confluence page (see [Jira releases and Confluence release notes](#jira-releases-and-confluence-release-notes)).
 
 PR descriptions and Jira text are sent to GitHub Models only when `MODELS_TOKEN` is configured. No credentials are included in the prompt. Jira enrichment reads only ticket summary/description, not comments or attachments. Model output is a draft for review, not proof that a ticket is complete or that a deployment passed.
 
@@ -119,6 +119,87 @@ Slack and Jira are independent: either can be configured alone, and a failure in
 Atlassian's endpoint can return HTTP 200 even when the secret is wrong or the rule is disabled, so the log says "webhook returned success", not "updated". Check the rule's audit log after the first real deploy.
 
 Use `DRY_RUN=true` to print the tickets a production deploy would report without sending anything.
+
+## Jira releases and Confluence release notes
+
+On a successful production deploy, the notification action can also publish the facts of the release: a Jira release with fix versions, and a Confluence page under **Engineering › Release notes**. This is the facts layer. A separate weekly agent reads it and writes the narrative. Nothing here calls an AI model or writes prose.
+
+It is off until `atlassian-email` and `atlassian-api-token` are passed. It runs after the Jira webhook step and uses the same shipped-ticket computation: the same range, the same ticket rule and the same revert handling (see [Which tickets count](#which-tickets-count)). If that computation fails, nothing is published.
+
+### What gets created
+
+- **Jira release** (project version) in `SF`, named `<repository> <version>`, for example `sf-api 4.26.0` (the repository name without the owner). It is marked released. The release date is the UTC date GitHub recorded the production deployment (the notification time if there is no record). The description is one line with a link to the Confluence page.
+- **Fix version:** that release is added to every shipped ticket in `SF`. It is added alongside existing fix versions, without notification emails. Tickets in other projects, and keys Jira doesn't return (missing, or not visible to the account), are skipped with a warning.
+- **Confluence pages** in space `Eng`:
+
+```text
+Release notes                    existing root page, created by hand
+└── sf-api release notes         one per repository, created on its first deploy; lists its child pages
+    ├── sf-api 4.26.0            one per deployed version
+    └── sf-api 4.25.0
+```
+
+The version page holds only facts:
+
+- **Details:** repository, version, deployed at (UTC), deployed commit, release or hotfix PR, GitHub release, previous production commit and the compare range.
+- **Tickets shipped:** key, summary, type and status. Status is read when the page is written, so tickets the Jira rule hasn't moved yet still show Dev Complete. Keys Jira doesn't return are listed as "Not found in Jira".
+- **Pull requests:** number, title, author, merged date and the shipped tickets each one closes. Sync PRs, release/hotfix PRs, reverts and reverted PRs are left out.
+- **Left out (reverted):** tickets and PRs left out because of reverts.
+
+Every value is escaped, and links are built only from validated parts.
+
+**Labels** on each version page: `release-notes` and `repo-<repository>`, for example `repo-sf-api`. The label is lowercase, and characters other than letters, digits, `_` and `-` become `-`. A weekly summary agent can find the week's pages with CQL `label = "release-notes" AND space = "Eng" AND created >= now("-7d")`, or one repository's with `label = "repo-sf-api"`. In Jira, use `project = SF AND fixVersion = "sf-api 4.26.0"`.
+
+### Order, reruns and failures
+
+1. Compute the shipped tickets and PRs from GitHub.
+2. Read the tickets from Jira, in one `/search/jql` request per 50 keys. JQL can reject the whole query when one key doesn't exist, so a rejected search is retried one ticket at a time.
+3. Find or create the repository page under the root page.
+4. Create the version page, or update it in place as a new page version. Add the labels.
+5. Create the Jira release, or update it (released, date, description with the page link).
+6. Add the fix version to the `SF` tickets that don't already have it.
+
+Every step looks before it creates, so a rerun updates the same page and release and adds no duplicates. A concurrent run that creates something first is reused. A redeploy of an already deployed commit, a rollback or a diverged deploy has no new range, so it publishes nothing and leaves the existing page as it was. Rerunning only the notification job republishes the same facts.
+
+A failure names the step and HTTP status, for example `Confluence: create version page failed (HTTP 403)`. It never includes the token, the URL or a response body. As with Slack and the Jira webhook, it fails the (non-blocking) notification step and doesn't stop the other channels. If it fails partway, rerun the notification job. A missing root page fails with `Confluence: root page "Release notes" not found in space Eng; create it first`.
+
+Use `DRY_RUN=true` (with the two inputs set) to print the page path, labels, release name and the tickets that would get the fix version, without any Atlassian request. Set `CONFLUENCE_PAGE_FILE=/path/page.html` to also write the page body, without Jira summaries.
+
+### Account, permissions and token
+
+Use a dedicated account, not a person's, and create the root page **Release notes** in the `Eng` space by hand first.
+
+- **Jira, project `SF`:** *Administer Projects*. Jira requires this, or *Administer Jira*, to create and update versions. Without it, Jira also ignores `notifyUsers=false` and watchers get an email for every fix-version edit. The account also needs *Browse Projects* and *Edit Issues*, which the project admin role normally has (check the permission scheme), and must be able to see the tickets if issue security is used.
+- **Confluence, space `Eng`:** view the space and add pages, which covers editing the pages it creates and their labels. If the **Release notes** page has restrictions, add the account to them.
+
+Requests use HTTP Basic auth (account email and API token) through the `api.atlassian.com/ex/{jira|confluence}/{cloudId}` gateway, so scoped API tokens work. The cloud ID defaults to ServeFirst's site (`atlassian-cloud-id`). Recommended scopes:
+
+- **Jira token**, classic scopes (recommended): `read:jira-work`, `write:jira-work`, `manage:jira-project`. The API reference lists `manage:jira-project` for creating and updating versions. The granular equivalent is long and marked beta: `read:project-version:jira`, `write:project-version:jira`, `write:issue:jira`, `read:issue-details:jira`, `read:issue:jira`, `read:project:jira`, `read:field:jira`, `read:field.default-value:jira`, `read:field.option:jira`, `read:group:jira`, `read:issue-meta:jira`, `read:issue-security-level:jira`, `read:issue.vote:jira`, `read:issue.changelog:jira`, `read:avatar:jira`, `read:status:jira`, `read:user:jira`, `read:field-configuration:jira`, `read:issue-type:jira`, `read:project.property:jira`, `read:application-role:jira`, `read:issue-type-hierarchy:jira`, `read:project-category:jira`, `read:project.component:jira`.
+- **Confluence token**, granular scopes (the v2 page and space APIs have no classic scope): `read:space:confluence`, `read:page:confluence`, `write:page:confluence`, `read:label:confluence`, `write:label:confluence`. The label endpoint (v1) also accepts the classic `write:confluence-content`.
+
+These scopes come from Atlassian's API reference and haven't been tested against a live token yet. Check them on the first deploy.
+
+A scoped token is created for one app (Jira or Confluence). Create one token per app and pass the Confluence one as `atlassian-confluence-api-token`. Without that input, the Jira token is used for both, which works for an unscoped token. Tokens expire after at most a year, so note the renewal date.
+
+Store them as organisation secrets visible to the application repositories: **`ATLASSIAN_RELEASE_EMAIL`**, **`ATLASSIAN_RELEASE_TOKEN`** (Jira, or both) and, for scoped tokens, **`ATLASSIAN_RELEASE_CONFLUENCE_TOKEN`**.
+
+### Wiring a repository
+
+Pass the inputs to the notification step. The job needs `deployments: read`, as for the Jira webhook:
+
+```yaml
+    permissions:
+      contents: read
+      pull-requests: read
+      deployments: read
+    ...
+        atlassian-email: ${{ secrets.ATLASSIAN_RELEASE_EMAIL }}
+        atlassian-api-token: ${{ secrets.ATLASSIAN_RELEASE_TOKEN }}
+        atlassian-confluence-api-token: ${{ secrets.ATLASSIAN_RELEASE_CONFLUENCE_TOKEN }}
+        # Defaults: atlassian-cloud-id (ServeFirst), jira-project: SF, confluence-space: Eng, confluence-root-title: Release notes
+```
+
+The log shows the Confluence page URL and the Jira release name. Without the email and token inputs, the step logs that publishing was skipped.
 
 ## Editing, freshness and delivery
 

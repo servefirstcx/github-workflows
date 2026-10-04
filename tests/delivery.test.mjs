@@ -4,6 +4,7 @@ import * as d from '../scripts/delivery.mjs';
 import {mkdtemp, readFile, writeFile, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {atlassianFake, EMAIL, TOKEN} from './atlassian-fixture.mjs';
 
 const BASE = 'a'.repeat(40), HEAD = 'b'.repeat(40), MERGE = 'c'.repeat(40);
 const notes = (text = 'Useful summary.\n\n- [#12](https://github.com/org/repo/pull/12) Fix things', head = HEAD) => `<!-- sf-release-notes:start -->\n<!-- sf-release-source:${JSON.stringify({base: BASE, head})} -->\n${text}\n<!-- sf-release-notes:end -->`;
@@ -28,7 +29,7 @@ const pr = (body = notes()) => ({number: 7, title: 'Release 1.2', body, merged: 
 // `GET /commits/{sha}/pulls` routes the REST fallback uses, so one fixture covers both.
 // The slice of GitHub's PullRequest schema the query uses: true = scalar, object = needs a sub-selection.
 const PR_SCHEMA = {number: true, title: true, body: true, mergedAt: true, baseRefName: true, headRefName: true,
-  mergeCommit: {oid: true}, baseRepository: {nameWithOwner: true}, headRepository: {nameWithOwner: true}};
+  mergeCommit: {oid: true}, baseRepository: {nameWithOwner: true}, headRepository: {nameWithOwner: true}, author: {login: true}};
 
 // "a b { c } d" -> {a: true, b: {c: true}, d: true}, checked against PR_SCHEMA the way GitHub
 // would: unknown fields, a sub-selection on a scalar or a bare object field are errors.
@@ -129,7 +130,8 @@ function graphqlData(routes, {query, variables}) {
     const full = p => ({number: p.number, title: p.title, body: p.body, mergedAt: p.merged_at || null,
       mergeCommit: p.merge_commit_sha ? {oid: p.merge_commit_sha} : null,
       baseRefName: p.base?.ref, baseRepository: p.base?.repo ? {nameWithOwner: p.base.repo.full_name} : null,
-      headRefName: p.head?.ref, headRepository: p.head?.repo ? {nameWithOwner: p.head.repo.full_name} : null});
+      headRefName: p.head?.ref, headRepository: p.head?.repo ? {nameWithOwner: p.head.repo.full_name} : null,
+      author: p.user ? {login: p.user.login} : null});
     const nodes = pages.map(p => pick(full(p), selection));
     repository[alias] = {associatedPullRequests: {totalCount: nodes.length, nodes: nodes.slice(0, 100)}};
   }
@@ -398,7 +400,7 @@ test('publish creates missing release even when tag already exists and verifies 
 import {closingKeys, branchKeys, shippedTicketKeys} from '../scripts/release-notes.mjs';
 const JIRA_HOOK = 'https://api-private.atlassian.com/automation/webhooks/jira/a/11111111-2222-3333-4444-555555555555/66666666-7777-8888-9999-000000000000';
 const PREV = 'd'.repeat(40), GAP = '9'.repeat(40), sha = n => String(n).padStart(40, 'e');
-const repoPr = (number, ref, extra = {}) => ({number, title: `Change ${number}`, body: '', merged_at: '2026-01-01T00:00:00Z', merged: true, merge_commit_sha: sha(number), head: {ref, sha: sha(number + 500), repo: {full_name: 'org/repo'}}, base: {ref: 'stage', repo: {full_name: 'org/repo'}}, ...extra});
+const repoPr = (number, ref, extra = {}) => ({number, title: `Change ${number}`, body: '', merged_at: '2026-01-01T00:00:00Z', merged: true, merge_commit_sha: sha(number), head: {ref, sha: sha(number + 500), repo: {full_name: 'org/repo'}}, base: {ref: 'stage', repo: {full_name: 'org/repo'}}, user: {login: `dev${number}`}, ...extra});
 const commit = (s, message) => ({sha: s, commit: {message}});
 const SECRET_BLOCK = '<!-- sf-release-notes:start -->\nCloses SF-99\n<!-- sf-release-notes:end -->';
 /** A release range: each commit lists the PRs GitHub associates with it. */
@@ -499,6 +501,9 @@ test('released tickets: reverted content commits and reverted hotfixes report no
   ];
   const result = await d.releasedTickets({...deployOptions, fetch: releaseFixture({range, extra: {'GET /pulls/7': release}}).fetch});
   assert.deepEqual(result.tickets, ['SF-93']);
+  assert.deepEqual(result.pullRequests, []);
+  assert.deepEqual(result.reverted.pullRequests.map(pr => [pr.number, pr.reason]), [[20, 'reverted']]);
+  assert.deepEqual(result.reverted.tickets, ['SF-20', 'SF-21', 'SF-91', 'SF-92']);
 });
 
 test('released tickets: a reverted hotfix drops the PRs merged into it, and the notes block never counts', async () => {
@@ -516,6 +521,9 @@ test('released tickets: a reverted hotfix drops the PRs merged into it, and the 
   const result = await d.releasedTickets({...deployOptions, fetch: releaseFixture({range, extra: {'GET /pulls/7': release}}).fetch});
   // SF-71/SF-72 were undone with the hotfix. SF-93 is only "closed" inside the hotfix's notes block, which never counts.
   assert.deepEqual(result.tickets, ['SF-93']);
+  // The hotfix wrapper (#30) is in neither PR list; the PR merged into it went with it.
+  assert.deepEqual(result.pullRequests, []);
+  assert.deepEqual(result.reverted.pullRequests.map(pr => [pr.number, pr.reason]), [[31, 'reverted']]);
 });
 
 test('released tickets: deployment statuses and history are read to the end, or fail closed', async () => {
@@ -542,6 +550,8 @@ test('released tickets: fork PRs from a branch named main count; notes-block "Re
   range.push([commit(MERGE, 'Merge pull request #7 from org/release/1.2'), [release]]);
   const result = await d.releasedTickets({...deployOptions, fetch: releaseFixture({range, extra: {'GET /pulls/7': release}}).fetch});
   assert.deepEqual(result.tickets, ['SF-77', 'SF-93']);
+  assert.deepEqual(result.pullRequests.map(pr => pr.number), [40, 41]);
+  assert.deepEqual(result.reverted.pullRequests.map(pr => [pr.number, pr.reason]), [[42, 'reverted'], [43, 'revert']]);
 });
 
 test('released tickets: hotfix-named feature branches keep their branch ticket', async () => {
@@ -656,7 +666,7 @@ test('released tickets: a PR from a deleted fork keeps its branch ticket and is 
 test('GraphQL fixture rejects aliases, directives, unknown fields and bare object fields instead of guessing', () => {
   assert.deepEqual(parseSelection('number mergeCommit { oid } headRepository { nameWithOwner }'), {number: true, mergeCommit: {oid: true}, headRepository: {nameWithOwner: true}});
   for (const text of ['mergeCommit { renamed: oid }', 'mergeCommit { oid @skip(if: true) }', 'number ...F']) assert.throws(() => parseSelection(text), /Unsupported GraphQL selection/);
-  for (const text of ['mergeCommit', 'baseRepository', 'headRepository', 'number { x }', 'mergeCommit { }', 'mergeCommit { id }', 'nope', 'number }', 'mergeCommit { oid']) assert.throws(() => parseSelection(text), /GraphQL|selection|field/, text);
+  for (const text of ['mergeCommit', 'baseRepository', 'headRepository', 'author', 'author { name }', 'number { x }', 'mergeCommit { }', 'mergeCommit { id }', 'nope', 'number }', 'mergeCommit { oid']) assert.throws(() => parseSelection(text), /GraphQL|selection|field/, text);
 });
 
 test('GraphQL fixture rejects any change to the query shape outside the PR fields', () => {
@@ -759,4 +769,101 @@ test('notification CLI: Jira only for successful production, independent of Slac
   } finally { await rm(directory, {recursive: true, force: true}); }
   assert.deepEqual(dry.jira, []);
   assert.ok(logs.some(line => /would report 7 released ticket\(s\): SF-1, SF-10, SF-11, SF-2, SF-5, SF-6, SF-7/.test(line)));
+});
+
+test('released tickets: shipped PR list leaves out sync and release wrappers, reverts and reverted PRs; GraphQL and REST agree', async () => {
+  const deployments = [200, [{id: 1, sha: MERGE, created_at: '2026-10-03T10:15:00Z'}, {id: 2, sha: PREV, created_at: '2026-09-26T09:00:00Z'}]];
+  const fact = (number, tickets, extra = {}) => ({number, title: `Change ${number}`, author: `dev${number}`, mergedAt: '2026-01-01T00:00:00Z', tickets, ...extra});
+  for (const extra of [{}, {'POST /graphql': [502, {}]}]) {
+    const result = await d.releasedTickets({...deployOptions, fetch: releaseFixture({deployments, extra}).fetch});
+    // #13 is a main->stage sync PR and #7 the release wrapper: in neither list.
+    assert.deepEqual(result.pullRequests, [fact(10, ['SF-1', 'SF-2']), fact(14, ['SF-7']), fact(15, ['SF-10', 'SF-11'])]);
+    assert.deepEqual(result.reverted, {pullRequests: [fact(11, ['SF-3'], {reason: 'reverted'}), fact(12, ['SF-3'], {title: 'Revert "Change 11"', reason: 'revert'})], tickets: ['SF-3']});
+    assert.deepEqual([result.base, result.previous, result.deployedAt], [PREV, PREV, '2026-10-03T10:15:00.000Z']);
+  }
+  const first = await d.releasedTickets({...deployOptions, fetch: releaseFixture({deployments: [200, [{id: 1, sha: MERGE}]]}).fetch});
+  assert.deepEqual([first.base, first.previous, first.deployedAt], [GAP, null, null]);
+  const rollback = await d.releasedTickets({...deployOptions, fetch: releaseFixture({compare: 'behind'}).fetch});
+  assert.deepEqual([rollback.base, rollback.pullRequests, rollback.reverted.pullRequests], [null, [], []]);
+});
+
+test('notification CLI: Jira release and Confluence page only for successful production, after the Jira webhook, independent of Slack', async () => {
+  const {main} = await import('../scripts/notify-deployment.mjs');
+  const env = {GITHUB_REPOSITORY: 'org/repo', GH_TOKEN: 'secret', DEPLOYED_SHA: MERGE, VERSION: '1.2', ENVIRONMENT: 'production', DEPLOY_STATUS: 'success', RUN_URL: deployOptions.runUrl,
+    JIRA_WEBHOOK_URL: JIRA_HOOK, JIRA_WEBHOOK_SECRET: 'shh', ATLASSIAN_EMAIL: EMAIL, ATLASSIAN_API_TOKEN: TOKEN};
+  const issues = Object.fromEntries(['SF-1', 'SF-2', 'SF-5', 'SF-6', 'SF-7', 'SF-10'].map(key => [key, {summary: `Summary ${key}`, type: 'Story', status: 'Dev Complete'}]));
+  const setup = ({slackStatus = 200, atlassian = {}, fixture = {}} = {}) => {
+    const github = releaseFixture({...fixture, extra: {'GET /releases/tags/v1.2': [404, {}], ...fixture.extra}}), fake = atlassianFake({issues, ...atlassian}), order = [];
+    const fetch = async (url, init) => {
+      if (url === JIRA_HOOK) { order.push('jira-webhook'); return new Response('{}'); }
+      if (url.startsWith('https://hooks.slack.com/')) { order.push('slack'); return new Response('', {status: slackStatus}); }
+      if (url.startsWith('https://api.atlassian.com/')) { order.push('atlassian'); return fake.fetch(url, init); }
+      return github.fetch(url, init);
+    };
+    return {fetch, fake, order};
+  };
+  const now = () => new Date('2026-10-03T10:15:00Z'), quiet = {log: () => {}, warn: () => {}, now};
+  const leaks = new RegExp([TOKEN, EMAIL, 'api\\.atlassian\\.com', 'SECRET'].join('|'));
+
+  const published = setup({slackStatus: 500}), logs = [];
+  await assert.rejects(main({...env, SLACK_WEBHOOK_URL: 'https://hooks.slack.com/services/T1/B2/S3'}, {...quiet, fetch: published.fetch, log: line => logs.push(line)}), /^Error: Slack delivery failed \(HTTP 500\)$/);
+  assert.deepEqual([...new Set(published.order)], ['slack', 'jira-webhook', 'atlassian']);
+  const page = published.fake.state.pages.find(item => item.title === 'repo 1.2');
+  assert.deepEqual(page.labels, ['release-notes', 'repo-repo']);
+  const [shipped, left] = page.body.split('<h2>Left out (reverted)</h2>');
+  assert.deepEqual([...shipped.matchAll(/pull\/(\d+)">#/g)].map(m => m[1]), ['7', '10', '14', '15']);
+  assert.deepEqual([...left.matchAll(/pull\/(\d+)">#/g)].map(m => m[1]), ['11', '12']);
+  assert.match(shipped, /<h2>Tickets shipped \(7\)<\/h2>/);
+  assert.match(shipped, /SF-11<\/a><\/td><td>Not found in Jira/);
+  assert.deepEqual(published.fake.state.versions.map(v => [v.name, v.released, v.releaseDate]), [['repo 1.2', true, '2026-10-03']]);
+  assert.deepEqual(Object.entries(published.fake.state.issues).filter(([, issue]) => issue.fixVersions?.length).map(([key]) => key).sort(), ['SF-1', 'SF-10', 'SF-2', 'SF-5', 'SF-6', 'SF-7']);
+  assert.ok(logs.includes(`Confluence release page: https://servefirst.atlassian.net/wiki/spaces/Eng/pages/${page.id}`));
+  assert.ok(logs.includes('Jira release "repo 1.2" released 2026-10-03; fix version added to 6 ticket(s), 0 already had it, 1 skipped.'));
+
+  // No credentials: skipped with a log line, nothing sent to Atlassian.
+  const absent = setup(), absentLogs = [];
+  await main({...env, ATLASSIAN_EMAIL: '', ATLASSIAN_API_TOKEN: ''}, {...quiet, fetch: absent.fetch, log: line => absentLogs.push(line)});
+  assert.deepEqual(absent.order, ['jira-webhook']);
+  assert.ok(absentLogs.includes('Jira release and Confluence page skipped: no Atlassian credentials configured.'));
+  // Half-configured credentials fail visibly before any Atlassian request; Jira is still told.
+  const half = setup();
+  await assert.rejects(main({...env, ATLASSIAN_API_TOKEN: ''}, {...quiet, fetch: half.fetch}), /^Error: Atlassian release not published: ATLASSIAN_API_TOKEN is required$/);
+  assert.deepEqual(half.order, ['jira-webhook']);
+  // Staging and failed deploys never validate or call Atlassian, even with a broken configuration.
+  for (const extra of [{ENVIRONMENT: 'staging'}, {DEPLOY_STATUS: 'failure', DEPLOYED_SHA: '', VERSION: ''}]) {
+    const other = setup();
+    await main({...env, ...extra, JIRA_WEBHOOK_URL: '', ATLASSIAN_CLOUD_ID: 'not-a-cloud', JIRA_PROJECT: 'bad key'}, {...quiet, fetch: other.fetch});
+    assert.deepEqual(other.order, []);
+  }
+  // If the shipped tickets can't be established, neither Jira nor Atlassian gets anything.
+  const blind = setup({fixture: {deployments: [403, {}]}});
+  await assert.rejects(main(env, {...quiet, fetch: blind.fetch}), error => /Jira not updated: Cannot read production deployments/.test(error.message) && /Atlassian release not published: Cannot read production deployments/.test(error.message));
+  assert.deepEqual(blind.order, []);
+  // An Atlassian failure fails the step without stopping Jira, and leaks nothing.
+  const broken = setup({atlassian: {pages: []}});
+  await assert.rejects(main(env, {...quiet, fetch: broken.fetch}), error => error.message === 'Atlassian release not published: Confluence: root page "Release notes" not found in space Eng; create it first' && !leaks.test(error.message));
+  assert.equal(broken.order[0], 'jira-webhook');
+  const failing = setup({atlassian: {fail: {'POST wiki/api/v2/pages': 403}}});
+  await assert.rejects(main(env, {...quiet, fetch: failing.fetch}), error => error.message === 'Atlassian release not published: Confluence: create repository page failed (HTTP 403)' && !leaks.test(error.message));
+  // A redeploy of an already deployed commit publishes nothing (and keeps the existing page as it was).
+  const redeploy = setup({fixture: {deployments: [200, [{id: 1, sha: MERGE}, {id: 3, sha: MERGE}, {id: 2, sha: PREV}]], extra: {'GET /deployments/3/statuses?per_page=100&page=1': [200, [{state: 'success'}]]}}});
+  assert.equal((await main(env, {...quiet, fetch: redeploy.fetch})).atlassian.published, false);
+  assert.deepEqual(redeploy.order, []);
+});
+
+test('notification CLI dry-run shows the Jira release and Confluence page it would publish without calling Atlassian', async () => {
+  const {main} = await import('../scripts/notify-deployment.mjs');
+  const env = {GITHUB_REPOSITORY: 'org/repo', GH_TOKEN: 'secret', DEPLOYED_SHA: MERGE, VERSION: '1.2', ENVIRONMENT: 'production', DEPLOY_STATUS: 'success', RUN_URL: deployOptions.runUrl,
+    ATLASSIAN_EMAIL: EMAIL, ATLASSIAN_API_TOKEN: TOKEN, DRY_RUN: 'true'};
+  const github = releaseFixture({extra: {'GET /releases/tags/v1.2': [404, {}]}}), logs = [];
+  const fetch = async (url, init) => { assert.ok(url.startsWith('https://api.github.com/'), 'Dry run only reads GitHub'); return github.fetch(url, init); };
+  const directory = await mkdtemp(join(tmpdir(), 'delivery-test-'));
+  try {
+    await main({...env, PAYLOAD_FILE: join(directory, 'p.json'), CONFLUENCE_PAGE_FILE: join(directory, 'page.html')}, {fetch, log: line => logs.push(line), warn: () => {}, now: () => new Date('2026-10-03T10:15:00Z')});
+    const body = await readFile(join(directory, 'page.html'), 'utf8');
+    assert.match(body, /<h2>Tickets shipped \(7\)<\/h2>/);
+    assert.match(body, /Not fetched \(dry run\)/);
+  } finally { await rm(directory, {recursive: true, force: true}); }
+  assert.ok(logs.some(line => line.startsWith('Atlassian dry-run: would publish Confluence page "repo 1.2" (Eng › Release notes › repo release notes; labels release-notes, repo-repo) with 7 ticket(s), 3 PR(s) and 2 reverted PR(s) left out.')));
+  assert.ok(logs.some(line => line === 'Atlassian dry-run: would release Jira version "repo 1.2" in SF dated 2026-10-03 and add it to 7 SF ticket(s) that exist: SF-1, SF-10, SF-11, SF-2, SF-5, SF-6, SF-7.'));
 });

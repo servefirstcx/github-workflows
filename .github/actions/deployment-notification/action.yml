@@ -1,5 +1,5 @@
 name: Deployment notification
-description: Send verified saved release notes to Slack, and released ticket keys to Jira, without commit or action metadata
+description: Send verified saved release notes to Slack, released ticket keys to Jira, and release facts to a Jira release and Confluence page, without commit or action metadata
 inputs:
   status:
     description: Actual deployment result
@@ -25,6 +25,27 @@ inputs:
   jira-webhook-secret:
     description: Secret for the Jira Automation webhook, sent as X-Automation-Webhook-Token. Required when jira-webhook-url is set
     required: false
+  atlassian-email:
+    description: Optional Atlassian service account email. With atlassian-api-token, a successful production deploy publishes a Jira release and a Confluence release page. The job needs deployments read
+    required: false
+  atlassian-api-token:
+    description: API token (scoped tokens work) for atlassian-email. Required when atlassian-email is set
+    required: false
+  atlassian-confluence-api-token:
+    description: Optional separate Confluence token for atlassian-email, for scoped tokens limited to one app. Defaults to atlassian-api-token
+    required: false
+  atlassian-cloud-id:
+    description: Atlassian site cloud ID used with the api.atlassian.com gateway
+    default: 829a96bf-7cc0-4e5d-8111-ddd56ce8fc24
+  jira-project:
+    description: Jira project key that gets the release and fix versions
+    default: SF
+  confluence-space:
+    description: Confluence space key for release pages
+    default: Eng
+  confluence-root-title:
+    description: Existing Confluence page that holds one release notes page per repository
+    default: Release notes
   main-branch:
     description: Production branch
     default: main
@@ -45,6 +66,13 @@ runs:
         SLACK_WEBHOOK_URL: ${{ inputs.webhook-url }}
         JIRA_WEBHOOK_URL: ${{ inputs.jira-webhook-url }}
         JIRA_WEBHOOK_SECRET: ${{ inputs.jira-webhook-secret }}
+        ATLASSIAN_EMAIL: ${{ inputs.atlassian-email }}
+        ATLASSIAN_API_TOKEN: ${{ inputs.atlassian-api-token }}
+        ATLASSIAN_CONFLUENCE_API_TOKEN: ${{ inputs.atlassian-confluence-api-token }}
+        ATLASSIAN_CLOUD_ID: ${{ inputs.atlassian-cloud-id }}
+        JIRA_PROJECT: ${{ inputs.jira-project }}
+        CONFLUENCE_SPACE: ${{ inputs.confluence-space }}
+        CONFLUENCE_ROOT_TITLE: ${{ inputs.confluence-root-title }}
         MAIN_BRANCH: ${{ inputs.main-branch }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       run: node "$GITHUB_ACTION_PATH/../../../scripts/notify-deployment.mjs"

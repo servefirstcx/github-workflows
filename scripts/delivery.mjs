@@ -40,7 +40,9 @@ const REVERTS_COMMIT = /\bThis reverts commit ([a-f0-9]{40})\b/gi;
  * batched 100 commits per GraphQL request.
  * Ticket rule (shippedTicketKeys): branch name, or a "Closes KEY" line in the PR
  * description or a commit message. Anything touched by a revert is left out.
- * When the range cannot be established, nothing is reported.
+ * When the range cannot be established, nothing is reported (base is null).
+ * Also returns the shipped PRs (no sync/release wrappers, reverts or reverted PRs)
+ * and what reverts left out, for the release page.
  */
 export async function releasedTickets(options) {
   const {repository, deployedSha, version, tagPrefix = 'v', mainBranch = 'main', releaseLabel = 'release', stagingBranch = 'stage'} = options;
@@ -48,8 +50,8 @@ export async function releasedTickets(options) {
   requireValue(await resolveTag(api, tagName(version, tagPrefix)) === deployedSha, 'Tag does not match deployed SHA');
   const release = await associatedReleasePR(api, deployedSha, mainBranch, releaseLabel);
   requireValue(release, 'No unique merged release PR for deployed SHA');
-  const {base, warnings} = await reportingBase(api, deployedSha);
-  if (!base) return {tickets: [], releasePr: release, warnings};
+  const {base, previous = null, deployedAt, warnings} = await reportingBase(api, deployedSha);
+  if (!base) return {tickets: [], pullRequests: [], reverted: {pullRequests: [], tickets: []}, releasePr: release, base: null, previous: null, deployedAt, warnings};
 
   const commits = await rangeCommits(api, base, deployedSha);
   const messages = new Map(commits.map(c => [c.sha, c.commit?.message || '']));
@@ -130,11 +132,17 @@ export async function releasedTickets(options) {
     if (revertPrs.has(pr.number)) continue;
     for (const key of shippedTicketKeys({branch: pr.head?.ref, body: String(pr.body || '').replace(NOTES_BLOCK, '')})) keys.add(key);
   }
-  return {tickets: [...keys].filter(key => !dropped.has(key)).sort(), releasePr: release, warnings};
+  const tickets = [...keys].filter(key => !dropped.has(key)).sort(), shipped = new Set(tickets);
+  const facts = (list, keysOf) => list.sort((a, b) => a.number - b.number).map(pr => ({number: pr.number, title: String(pr.title || ''), author: pr.user?.login || null, mergedAt: pr.merged_at, tickets: keysOf(pr)}));
+  const left = pr => revertPrs.has(pr.number) || droppedPrs.has(pr.number);
+  return {tickets, releasePr: release, base, previous, deployedAt, warnings,
+    pullRequests: facts([...prs.values()].filter(pr => !left(pr)), pr => prKeys(pr).filter(key => shipped.has(key))),
+    reverted: {pullRequests: facts([...prs.values()].filter(left), prKeys).map(pr => ({...pr, reason: revertPrs.has(pr.number) ? 'revert' : 'reverted'})),
+      tickets: [...keys].filter(key => dropped.has(key)).sort()}};
 }
 
 const GRAPHQL_BATCH = 100;
-const PR_FIELDS = 'number title body mergedAt mergeCommit { oid } baseRefName baseRepository { nameWithOwner } headRefName headRepository { nameWithOwner }';
+const PR_FIELDS = 'number title body mergedAt mergeCommit { oid } baseRefName baseRepository { nameWithOwner } headRefName headRepository { nameWithOwner } author { login }';
 
 /**
  * Merged-or-not PRs containing each commit, the same list as GET /commits/{sha}/pulls,
@@ -173,7 +181,8 @@ function restShape(node) {
   return {number: node?.number, title: node?.title, body: node?.body, merged_at: node?.mergedAt || null,
     merge_commit_sha: node?.mergeCommit?.oid || null,
     base: {ref: node?.baseRefName, repo: {full_name: node?.baseRepository?.nameWithOwner}},
-    head: {ref: node?.headRefName, repo: {full_name: node?.headRepository?.nameWithOwner}}};
+    head: {ref: node?.headRefName, repo: {full_name: node?.headRepository?.nameWithOwner}},
+    user: node?.author ? {login: node.author.login} : null};
 }
 
 async function restPullRequests(api, sha) {
@@ -192,7 +201,7 @@ async function reportingBase(api, deployedSha) {
   // Newest first. Candidates start after this deploy's own record, so reruns and replays look
   // further back. Pages are read only until the answer is known.
   const deployments = [];
-  let checked = 0, done = false;
+  let checked = 0, done = false, deployedAt = null;
   const evaluate = async deployment => {
     if (!SHA.test(deployment.sha || '') || !Number.isSafeInteger(deployment.id)) return null;
     // A newer deploy marks older ones "inactive"; any success means it reached production.
@@ -209,7 +218,7 @@ async function reportingBase(api, deployedSha) {
     // (Rerunning only the notification job adds no deployment record, so that still resends.)
     if (deployment.sha === deployedSha) return {base: null, warnings: ['This commit was already deployed to production; no tickets reported. Rerun only the notification job to resend.']};
     const {status} = await api(`/compare/${deployment.sha}...${deployedSha}`);
-    if (status === 'ahead') return {base: deployment.sha, warnings: []};
+    if (status === 'ahead') return {base: deployment.sha, previous: deployment.sha, warnings: []};
     if (status === 'behind' || status === 'identical') return {base: null, warnings: ['Deployed version is not newer than the previous production deployment (rollback or redeploy); no tickets reported.']};
     return {base: null, warnings: ['Previous production deployment is not an ancestor of this one; no tickets reported. Mark them in Jira by hand.']};
   };
@@ -225,17 +234,19 @@ async function reportingBase(api, deployedSha) {
     deployments.push(...list);
     done = list.length < 100;
     const own = deployments.findIndex(deployment => deployment?.sha === deployedSha);
+    // When GitHub recorded this deploy, so a rerun days later still dates the release correctly.
+    if (own >= 0 && !deployedAt && !Number.isNaN(Date.parse(deployments[own].created_at))) deployedAt = new Date(deployments[own].created_at).toISOString();
     // Until this deploy's own record shows up, every record seen so far may be newer than it.
     if (own < 0 && !done) continue;
     for (checked = Math.max(checked, own + 1); checked < deployments.length; checked++) {
       const result = await evaluate(deployments[checked]);
-      if (result) return result;
+      if (result) return {...result, deployedAt};
     }
   }
   // First ever recorded production deploy: report only this release PR's own changes.
   const parent = (await api(`/commits/${deployedSha}`)).parents?.[0]?.sha;
   requireValue(SHA.test(parent || ''), 'Deployed commit has no parent');
-  return {base: parent, warnings: ['No earlier successful production deployment found; reporting this release PR only.']};
+  return {base: parent, deployedAt, warnings: ['No earlier successful production deployment found; reporting this release PR only.']};
 }
 
 async function rangeCommits(api, base, head) {
