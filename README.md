@@ -37,7 +37,9 @@ Deploys Docker containers to AWS ECS with proper task definition management. Thi
 - Creates a new task definition revision for each deployment (enables rollbacks)
 - Updates the ECS service to use the new task definition
 - Waits for service stability
-- Sends deployment notifications to Slack (optional)
+- Sends deployment notifications to Slack, and released Jira tickets on production deploys (optional)
+
+Both deploy workflows notify from a separate job that needs `pull-requests: read` and `deployments: read`, so callers must grant them in addition to `id-token: write` and `contents: read`. See [release notes setup](docs/release-notes.md#caller-wiring).
 
 ### 6. S3 + CloudFront Deployment Workflow (`deploy-s3-cloudfront.yml`)
 
