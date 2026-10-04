@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, {after} from 'node:test';
 import assert from 'node:assert/strict';
 import * as d from '../scripts/delivery.mjs';
 import {mkdtemp, readFile, writeFile, rm} from 'node:fs/promises';
@@ -24,6 +24,118 @@ test('strict notes parser preserves human Markdown with provenance', () => {
 });
 
 const pr = (body = notes()) => ({number: 7, title: 'Release 1.2', body, merged: true, merge_commit_sha: MERGE, head: {sha: HEAD}, base: {ref: 'main', sha: MERGE}, labels: [{name: 'release'}], html_url: 'https://github.com/org/repo/pull/7'});
+// Answers the batched associatedPullRequests GraphQL query from the same
+// `GET /commits/{sha}/pulls` routes the REST fallback uses, so one fixture covers both.
+// The slice of GitHub's PullRequest schema the query uses: true = scalar, object = needs a sub-selection.
+const PR_SCHEMA = {number: true, title: true, body: true, mergedAt: true, baseRefName: true, headRefName: true,
+  mergeCommit: {oid: true}, baseRepository: {nameWithOwner: true}, headRepository: {nameWithOwner: true}};
+
+// "a b { c } d" -> {a: true, b: {c: true}, d: true}, checked against PR_SCHEMA the way GitHub
+// would: unknown fields, a sub-selection on a scalar or a bare object field are errors.
+// Deliberately tiny: aliases, directives, arguments and fragments fail outright, so this
+// fixture can never answer with a field real GraphQL would have renamed, omitted or rejected.
+function parseSelection(text, schema = PR_SCHEMA) {
+  assert.match(text, /^[A-Za-z_{}\s]*$/, `Unsupported GraphQL selection syntax in fixture: ${text}`);
+  const tokens = text.match(/[A-Za-z_]+|[{}]/g) || [];
+  const read = type => {
+    const out = {};
+    while (tokens.length && tokens[0] !== '}') {
+      const name = tokens.shift();
+      assert.ok(name !== '{' && Object.hasOwn(type, name), `Unknown GraphQL field in fixture: ${name}`);
+      if (tokens[0] === '{') {
+        assert.ok(type[name] !== true, `Sub-selection on scalar field ${name}`);
+        tokens.shift(); out[name] = read(type[name]);
+        assert.equal(tokens.shift(), '}', `Unclosed selection on ${name}`);
+        assert.ok(Object.keys(out[name]).length, `Empty selection on ${name}`);
+      } else {
+        assert.ok(type[name] === true, `Object field ${name} needs a sub-selection`);
+        out[name] = true;
+      }
+    }
+    return out;
+  };
+  const result = read(schema);
+  assert.equal(tokens.length, 0, `Unbalanced GraphQL selection in fixture: ${text}`);
+  return result;
+}
+
+function pick(value, selection) {
+  if (value === null || value === undefined) return value;
+  if (selection === true) { assert.ok(typeof value !== 'object', 'Scalar selection returned an object'); return value; }
+  return Object.fromEntries(Object.entries(selection).filter(([k]) => k in value).map(([k, sub]) => [k, pick(value[k], sub)]));
+}
+
+// A fixture mistake inside a GraphQL reply would otherwise be swallowed by the production REST
+// fallback and look like a pass, so every one is recorded and fails the file in after().
+const FIXTURE_ERRORS = [];
+after(() => assert.deepEqual(FIXTURE_ERRORS, [], 'GraphQL fixture errors were hidden by the REST fallback'));
+
+function graphqlFromRest(routes, request) {
+  const override = routes['POST /graphql'];
+  let value;
+  try { value = override ? (typeof override === 'function' ? override(request) : override) : graphqlData(routes, request); }
+  catch (error) { FIXTURE_ERRORS.push(error.message); throw error; }
+  const [status, data] = Array.isArray(value) ? value : [200, value];
+  return new Response(JSON.stringify(data), {status});
+}
+
+function graphqlData(routes, {query, variables}) {
+  // The whole query must be exactly the supported shape: variables, repository(owner, name), one
+  // `cN: object(oid: $cN) { ... on Commit { associatedPullRequests(first: 100) { totalCount nodes {...} } } }`
+  // per commit, nothing else. Aliases, directives, a different page size or a renamed field
+  // anywhere fail here instead of being answered as if GitHub had accepted them.
+  const aliases = Object.keys(variables).filter(k => /^c\d+$/.test(k));
+  assert.deepEqual(Object.keys(variables).sort(), ['name', 'owner', ...aliases].sort(), 'Unexpected GraphQL variables');
+  const flat = query.replace(/\s+/g, ' ').trim();
+  const head = `query($owner: String!, $name: String!, ${aliases.map(a => `$${a}: GitObjectID!`).join(', ')}) { repository(owner: $owner, name: $name) { `;
+  assert.ok(flat.startsWith(head), `Unexpected GraphQL query head: ${flat.slice(0, 160)}`);
+  let rest = flat.slice(head.length);
+  for (const alias of aliases) {
+    const prefix = `${alias}: object(oid: $${alias}) { ... on Commit { associatedPullRequests(first: 100) { totalCount nodes { `;
+    assert.ok(rest.startsWith(prefix), `Unexpected GraphQL selection for ${alias}: ${rest.slice(0, 160)}`);
+    rest = rest.slice(prefix.length);
+    // Close of `nodes {`, by brace depth (the PR fields contain their own braces).
+    let depth = 1, end = 0;
+    for (; end < rest.length && depth; end++) { if (rest[end] === '{') depth++; else if (rest[end] === '}') depth--; }
+    assert.equal(depth, 0, `Unclosed GraphQL selection for ${alias}`);
+    parseSelection(rest.slice(0, end - 1)); // PR fields, checked against PR_SCHEMA
+    rest = rest.slice(end);
+    // associatedPullRequests, ... on Commit, object
+    assert.ok(rest.startsWith(' } } }'), `Unexpected GraphQL selection after nodes for ${alias}: ${rest.slice(0, 80)}`);
+    rest = rest.slice(' } } }'.length).trimStart();
+  }
+  assert.equal(rest, '} }', `Unexpected GraphQL query tail: ${rest.slice(0, 160)}`);
+  assert.equal(variables.owner, 'org'); assert.equal(variables.name, 'repo');
+  const repository = {};
+  for (const [alias, sha] of Object.entries(variables).filter(([k]) => /^c\d+$/.test(k))) {
+    assert.match(query, new RegExp(`${alias}: object\\(oid: \\$${alias}\\)`));
+    const first = routes[`GET /commits/${sha}/pulls?per_page=100&page=1`];
+    assert.ok(first, `Unexpected GraphQL commit ${sha}`);
+    const pages = [];
+    for (let page = 1; routes[`GET /commits/${sha}/pulls?per_page=100&page=${page}`]; page++) {
+      const value = routes[`GET /commits/${sha}/pulls?per_page=100&page=${page}`];
+      const [status, list] = Array.isArray(value) && typeof value[0] === 'number' ? value : [200, value];
+      if (status !== 200) return [status, {}];
+      pages.push(...list);
+      if (list.length < 100) break;
+    }
+    // Only the fields (and nested fields) the query actually selects, so changing PR_FIELDS fails tests.
+    // The braces after this alias's "nodes", matched by depth rather than a regex, so a short cut can't pass.
+    const at = query.indexOf(`${alias}: object(`), open = query.indexOf('nodes {', at) + 'nodes '.length;
+    assert.ok(at >= 0 && open > at, `No nodes selection for ${alias}`);
+    let depth = 0, close = open;
+    for (; close < query.length; close++) { if (query[close] === '{') depth++; else if (query[close] === '}' && --depth === 0) break; }
+    const selection = parseSelection(query.slice(open + 1, close));
+    const full = p => ({number: p.number, title: p.title, body: p.body, mergedAt: p.merged_at || null,
+      mergeCommit: p.merge_commit_sha ? {oid: p.merge_commit_sha} : null,
+      baseRefName: p.base?.ref, baseRepository: p.base?.repo ? {nameWithOwner: p.base.repo.full_name} : null,
+      headRefName: p.head?.ref, headRepository: p.head?.repo ? {nameWithOwner: p.head.repo.full_name} : null});
+    const nodes = pages.map(p => pick(full(p), selection));
+    repository[alias] = {associatedPullRequests: {totalCount: nodes.length, nodes: nodes.slice(0, 100)}};
+  }
+  return {data: {repository}};
+}
+
 function apiFixture(overrides = {}) {
   const calls = [];
   let release;
@@ -43,12 +155,13 @@ function apiFixture(overrides = {}) {
     const key = `${init.method || 'GET'} ${path}`;
     const body = init.body && JSON.parse(init.body);
     calls.push({key, body, init});
+    if (key === 'POST /graphql') return graphqlFromRest(routes, body);
     assert.ok(key in routes, `Unexpected request ${key}`);
     const value = typeof routes[key] === 'function' ? routes[key](body) : routes[key];
     const [status, data] = Array.isArray(value) ? value : [200, value];
     return new Response(JSON.stringify(data), {status});
   };
-  return {fetch, calls};
+  return {fetch, calls, graphql: request => graphqlData(routes, request)};
 }
 const publishOptions = {repository: 'org/repo', token: 'secret', version: '1.2', event: {action: 'closed', pull_request: pr()}};
 const deployOptions = {repository: 'org/repo', token: 'secret', version: '1.2', deployedSha: MERGE, environment: 'production', status: 'success', runUrl: 'https://github.com/org/repo/actions/runs/123'};
@@ -289,6 +402,8 @@ const repoPr = (number, ref, extra = {}) => ({number, title: `Change ${number}`,
 const commit = (s, message) => ({sha: s, commit: {message}});
 const SECRET_BLOCK = '<!-- sf-release-notes:start -->\nCloses SF-99\n<!-- sf-release-notes:end -->';
 /** A release range: each commit lists the PRs GitHub associates with it. */
+const releasePrFor = () => ({...pr(), merged_at: '2026-01-02T00:00:00Z', head: {sha: HEAD, ref: 'release/1.2', repo: {full_name: 'org/repo'}}, base: {ref: 'main', repo: {full_name: 'org/repo'}}, body: 'Closes SF-6'});
+
 function releaseFixture({deployments = [200, [{id: 1, sha: MERGE}, {id: 2, sha: PREV}]], compare = 'ahead', extra = {}, range} = {}) {
   const release = {...pr(), merged_at: '2026-01-02T00:00:00Z', head: {sha: HEAD, ref: 'release/1.2', repo: {full_name: 'org/repo'}}, base: {ref: 'main', repo: {full_name: 'org/repo'}}, body: `Closes SF-6\n${SECRET_BLOCK}`};
   const p = {
@@ -475,6 +590,107 @@ test('released tickets: redeploying an already deployed commit reports nothing; 
     'GET /deployments/3/statuses?per_page=100&page=1': [200, [{state: 'failure'}]],
   }});
   assert.ok((await d.releasedTickets({...deployOptions, fetch: retried.fetch})).tickets.includes('SF-1'));
+});
+
+test('released tickets: commits are matched to PRs 100 at a time over GraphQL, not one REST call each', async () => {
+  const many = Array.from({length: 150}, (_, i) => [commit(sha(5000 + i), `change ${i}\n\nCloses SF-${1000 + i}`), [repoPr(500 + i, `SF-${2000 + i}-x`, {merge_commit_sha: sha(5000 + i)})]]);
+  const range = [...many, [commit(MERGE, 'Merge pull request #7 from org/release/1.2'), [releasePrFor()]]];
+  const fixture = releaseFixture({range});
+  const result = await d.releasedTickets({...deployOptions, fetch: fixture.fetch});
+  assert.equal(result.tickets.length, 301); // 150 Closes + 150 branch keys + SF-6 on the release PR
+  assert.equal(fixture.calls.filter(c => c.key === 'POST /graphql').length, 2);
+  assert.equal(fixture.calls.filter(c => /^GET \/commits\/[a-f0-9]{40}\/pulls/.test(c.key) && !c.key.includes(MERGE)).length, 0);
+  assert.equal(fixture.calls[fixture.calls.findIndex(c => c.key === 'POST /graphql')].init.headers.Authorization, 'Bearer secret');
+});
+
+test('released tickets: a commit in more than 100 PRs falls back to paginated REST', async () => {
+  const crowded = Array.from({length: 100}, (_, i) => ({number: 900 + i, merged_at: null}));
+  const range = [[commit(sha(6000), 'busy commit'), [...crowded, repoPr(42, 'SF-42-busy', {merge_commit_sha: sha(6000)})]],
+    [commit(MERGE, 'Merge pull request #7 from org/release/1.2'), [releasePrFor()]]];
+  const fixture = releaseFixture({range, extra: {
+    [`GET /commits/${sha(6000)}/pulls?per_page=100&page=1`]: [200, crowded],
+    [`GET /commits/${sha(6000)}/pulls?per_page=100&page=2`]: [200, [repoPr(42, 'SF-42-busy', {merge_commit_sha: sha(6000)})]],
+  }});
+  const result = await d.releasedTickets({...deployOptions, fetch: fixture.fetch});
+  assert.ok(result.tickets.includes('SF-42'));
+  assert.ok(fixture.calls.some(c => c.key.endsWith(`${sha(6000)}/pulls?per_page=100&page=2`)));
+});
+
+test('released tickets: a failed GraphQL batch falls back to REST and gives the same tickets', async () => {
+  const expected = (await d.releasedTickets({...deployOptions, fetch: releaseFixture().fetch})).tickets;
+  for (const reply of [[200, {errors: [{message: 'timeout'}], data: {repository: {}}}], [502, {}], [403, {}]]) {
+    const fixture = releaseFixture({extra: {'POST /graphql': reply}});
+    assert.deepEqual((await d.releasedTickets({...deployOptions, fetch: fixture.fetch})).tickets, expected);
+    assert.ok(fixture.calls.some(c => /^GET \/commits\/[a-f0-9]{40}\/pulls/.test(c.key) && !c.key.includes(MERGE)));
+  }
+});
+
+test('released tickets: a missing commit, or GraphQL and REST both failing, fails closed', async () => {
+  await assert.rejects(d.releasedTickets({...deployOptions, fetch: releaseFixture({extra: {'POST /graphql': [200, {data: {repository: {}}}]}}).fetch}), /associated pull request/);
+  const down = releaseFixture({extra: {'POST /graphql': [502, {}], [`GET /commits/${sha(10)}/pulls?per_page=100&page=1`]: [502, {}]}});
+  await assert.rejects(d.releasedTickets({...deployOptions, fetch: down.fetch}), /GitHub request failed/);
+});
+
+test('released tickets: a null PR node is resolved over REST, so a revert is not missed', async () => {
+  const expected = (await d.releasedTickets({...deployOptions, fetch: releaseFixture().fetch})).tickets;
+  assert.ok(!expected.includes('SF-3'));
+  const base = releaseFixture();
+  const withNull = releaseFixture({extra: {'POST /graphql': ({query, variables}) => {
+    const reply = structuredClone(base.graphql({query, variables}));
+    for (const value of Object.values(reply.data.repository)) {
+      value.associatedPullRequests.nodes = value.associatedPullRequests.nodes.map(n => n.number === 12 ? null : n);
+    }
+    return reply;
+  }}});
+  assert.deepEqual((await d.releasedTickets({...deployOptions, fetch: withNull.fetch})).tickets, expected);
+});
+
+test('released tickets: a PR from a deleted fork keeps its branch ticket and is never a sync PR', async () => {
+  const forkPr = {...repoPr(77, 'SF-77-from-fork', {merge_commit_sha: sha(7700)}), head: {ref: 'SF-77-from-fork', repo: null}};
+  const range = [[commit(sha(7700), 'Merge pull request #77 from gone/SF-77-from-fork'), [forkPr]],
+    [commit(MERGE, 'Merge pull request #7 from org/release/1.2'), [releasePrFor()]]];
+  const result = await d.releasedTickets({...deployOptions, fetch: releaseFixture({range}).fetch});
+  assert.deepEqual(result.tickets, ['SF-6', 'SF-77']);
+});
+
+test('GraphQL fixture rejects aliases, directives, unknown fields and bare object fields instead of guessing', () => {
+  assert.deepEqual(parseSelection('number mergeCommit { oid } headRepository { nameWithOwner }'), {number: true, mergeCommit: {oid: true}, headRepository: {nameWithOwner: true}});
+  for (const text of ['mergeCommit { renamed: oid }', 'mergeCommit { oid @skip(if: true) }', 'number ...F']) assert.throws(() => parseSelection(text), /Unsupported GraphQL selection/);
+  for (const text of ['mergeCommit', 'baseRepository', 'headRepository', 'number { x }', 'mergeCommit { }', 'mergeCommit { id }', 'nope', 'number }', 'mergeCommit { oid']) assert.throws(() => parseSelection(text), /GraphQL|selection|field/, text);
+});
+
+test('GraphQL fixture rejects any change to the query shape outside the PR fields', () => {
+  const routes = {[`GET /commits/${sha(1)}/pulls?per_page=100&page=1`]: [200, []]};
+  const vars = {owner: 'org', name: 'repo', c0: sha(1)};
+  const good = `query($owner: String!, $name: String!, $c0: GitObjectID!) {
+      repository(owner: $owner, name: $name) {
+        c0: object(oid: $c0) { ... on Commit { associatedPullRequests(first: 100) { totalCount nodes { number mergeCommit { oid } } } } }
+      }
+    }`;
+  assert.deepEqual(graphqlData(routes, {query: good, variables: vars}), {data: {repository: {c0: {associatedPullRequests: {totalCount: 0, nodes: []}}}}});
+  for (const [from, to] of [['totalCount ', ''], ['totalCount', 'count: totalCount'], ['nodes {', 'renamed: nodes {'],
+    ['associatedPullRequests(', 'prs: associatedPullRequests('], ['(first: 100)', '(first: 100) @skip(if: true)'],
+    ['repository(owner: $owner, name: $name)', 'repository(owner: $owner, name: $name) @skip(if: true)'], ['first: 100', 'first: 1'],
+    ['c0: object', 'x0: object'], ['... on Commit', '... on Tree']]) {
+    assert.throws(() => graphqlData(routes, {query: good.replace(from, to), variables: vars}), /GraphQL/, `${from} -> ${to}`);
+  }
+  assert.throws(() => graphqlData(routes, {query: good, variables: {...vars, extra: 1}}), /variables/);
+});
+
+test('released tickets: dropping a selected GraphQL field changes the result (fixture honours the query)', async () => {
+  const fixture = releaseFixture();
+  const original = fixture.fetch;
+  const strip = async (url, init = {}) => {
+    if (String(url).endsWith('/graphql')) {
+      const body = JSON.parse(init.body);
+      body.query = body.query.replaceAll('number title body mergedAt', 'number title mergedAt');
+      init = {...init, body: JSON.stringify(body)};
+    }
+    return original(url, init);
+  };
+  const full = (await d.releasedTickets({...deployOptions, fetch: releaseFixture().fetch})).tickets;
+  const noBody = (await d.releasedTickets({...deployOptions, fetch: strip})).tickets;
+  assert.notDeepEqual(noBody, full);
 });
 
 test('released tickets: long deployment history is fine when the previous deploy is near the top', async () => {
