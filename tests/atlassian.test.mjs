@@ -121,6 +121,19 @@ test('an archived Jira release is refused before any ticket is edited', async ()
   await assert.rejects(a.publishAtlassianRelease(options(fake)), /^Error: Jira: release "sf-api 4.26.0" is archived; unarchive it in SF › Releases, then rerun$/);
   assert.ok(!fake.writes().some(call => call.startsWith('PUT jira/')));
   assert.ok(Object.values(fake.state.issues).every(issue => !issue.fixVersions?.length));
+  // The update must come back released and unarchived (or silent on those fields) before tickets are edited.
+  for (const reply of [{archived: true}, {released: false}, {id: 'x'}]) {
+    const odd = atlassianFake({issues: issues(), versions: [{id: '77', name: 'sf-api 4.26.0', released: false}]});
+    const {fetch} = odd;
+    const wrapped = async (url, init) => /\/version\/77$/.test(url) && init.method === 'PUT'
+      ? (await fetch(url, init), new Response(JSON.stringify({id: '77', name: 'sf-api 4.26.0', released: true, ...reply}), {status: 200})) : fetch(url, init);
+    await assert.rejects(a.publishAtlassianRelease(options(odd, {fetch: wrapped})), /^Error: Jira: update release returned an unexpected release$/);
+    assert.ok(!odd.writes().some(call => call.startsWith('PUT jira/issue/')));
+  }
+  const terse = atlassianFake({issues: issues(), versions: [{id: '77', name: 'sf-api 4.26.0', released: false}]});
+  const terseFetch = async (url, init) => /\/version\/77$/.test(url) && init.method === 'PUT'
+    ? (await terse.fetch(url, init), new Response(JSON.stringify({id: '77'}), {status: 200})) : terse.fetch(url, init);
+  assert.equal((await a.publishAtlassianRelease(options(terse, {fetch: terseFetch}))).fixVersions.added, 2);
 });
 
 test('a page updated by another run between read and write is reread and retried, within a limit', async () => {

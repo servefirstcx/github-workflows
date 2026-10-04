@@ -243,7 +243,8 @@ export async function publishAtlassianRelease({email, token, confluenceToken, de
   requireValue(release.archived !== true, `Jira: release "${plan.versionName}" is archived; unarchive it in ${plan.project} › Releases, then rerun`);
   if (Object.entries(wanted).some(([field, value]) => release[field] !== value)) {
     release = await api.jira('update release', `/version/${release.id}`, {method: 'PUT', body: wanted});
-    requireValue(ID.test(String(release?.id)) && release.archived !== true && release.released === true, 'Jira: update release returned an unexpected release');
+    // Only an explicit contrary value fails: Jira's schema doesn't promise every field in the response.
+    requireValue(ID.test(String(release?.id)) && release.archived !== true && release.released !== false, 'Jira: update release returned an unexpected release');
   }
 
   const warnings = [], targets = [];
