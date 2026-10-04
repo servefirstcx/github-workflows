@@ -94,7 +94,7 @@ Nothing is validated or sent for staging, dev or failed deploys. GitHub holds on
 1. Trigger: *Incoming webhook*, "Issues provided in the webhook HTTP POST body". Copy the URL and secret.
 2. Condition (JQL): `project = SF AND status = "Dev Complete" AND issuetype != Epic`. Only tickets the team has marked Dev Complete move. Other projects, epics and tickets still in progress are ignored. This also covers a ticket split across repositories or PRs: it only moves once someone marks it Dev Complete, so leave it in progress until every part has merged.
 3. Action: transition to *Done (In Production)*.
-4. Action: comment `Released to production in {{webhookData.data.repository}} v{{webhookData.data.version}}: {{webhookData.data.notesUrl}}` (the extra fields sit under `data` in the POST body).
+4. Action: comment `Released to production in {{webhookData.repository}} v{{webhookData.version}}: {{webhookData.notesUrl}}` (Jira exposes the POST body's `data` fields directly on `webhookData`; `webhookData.data.*` renders empty).
 
 This rule exists in SF as **"Release workflow → mark released tickets Done (In Production)"**. The old sprint-close rule that bulk-moved Dev Complete tickets has been disabled.
 
