@@ -8,6 +8,8 @@ This repository contains reusable GitHub Actions workflows for ServeFirst reposi
 
 Creates a release PR with a version bump, a short summary and a complete linked PR/ticket list. Optional GitHub Models and read-only Jira context improve the wording. See [release notes setup and rollout](docs/release-notes.md) for secrets, caller examples, refresh behavior and the shared Slack notification action.
 
+After a successful production deploy, the shared `deployment-notification` action can also report the shipped tickets to Jira, and publish the release's facts to a Jira release (with fix versions) and a Confluence page under Engineering › Release notes. See [Jira releases and Confluence release notes](docs/release-notes.md#jira-releases-and-confluence-release-notes).
+
 ### 2. Tag Release Workflow (`tag-release.yml`)
 
 Automatically tags releases when PRs are merged to main.
