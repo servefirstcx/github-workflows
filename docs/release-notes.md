@@ -159,9 +159,13 @@ Every value is escaped, and links are built only from validated parts.
 5. Create the Jira release, or update it (released, date, description with the page link).
 6. Add the fix version to the `SF` tickets that don't already have it.
 
-Every step looks before it creates, so a rerun updates the same page and release and adds no duplicates. A concurrent run that creates something first is reused. A redeploy of an already deployed commit, a rollback or a diverged deploy has no new range, so it publishes nothing and leaves the existing page as it was. Rerunning only the notification job republishes the same facts.
+Every step looks before it creates, so a rerun updates the same page and release and adds no duplicates. A concurrent run that creates something first is reused, and if it updates the version page between our read and write, the page is reread and the update retried (up to three tries). A redeploy of an already deployed commit, a rollback or a diverged deploy has no new range, so it publishes nothing and leaves the existing page as it was. Rerunning only the notification job republishes the same facts.
 
 A failure names the step and HTTP status, for example `Confluence: create version page failed (HTTP 403)`. It never includes the token, the URL or a response body. As with Slack and the Jira webhook, it fails the (non-blocking) notification step and doesn't stop the other channels. If it fails partway, rerun the notification job. A missing root page fails with `Confluence: root page "Release notes" not found in space Eng; create it first`.
+
+Page titles are unique across the space, so a page is only reused where it belongs: the repository page directly under the root page, and the version page directly under its repository page. If a page with that title exists anywhere else, for example a hand-written `sf-api 4.26.0` in another section, the step fails before writing anything with `Confluence: a page titled "sf-api 4.26.0" already exists outside "sf-api release notes"; rename or move it, then rerun`. Nothing outside the release tree is ever overwritten.
+
+An existing Jira release with the same name that is **archived** fails with `Jira: release "sf-api 4.26.0" is archived; unarchive it in SF › Releases, then rerun`, before any ticket is edited. Jira can accept an edit that adds an archived version and then not apply it, so the step never relies on one.
 
 Use `DRY_RUN=true` (with the two inputs set) to print the page path, labels, release name and the tickets that would get the fix version, without any Atlassian request. Set `CONFLUENCE_PAGE_FILE=/path/page.html` to also write the page body, without Jira summaries.
 
@@ -201,7 +205,7 @@ Pass the inputs to the notification step. The job needs `deployments: read`, as 
         # Defaults: atlassian-cloud-id (ServeFirst), jira-project: SF, confluence-space: Eng, confluence-root-title: Release notes
 ```
 
-The log shows the Confluence page URL and the Jira release name. Without the email and token inputs, the step logs that publishing was skipped.
+The log shows the Confluence page URL and the Jira release name. With none of the three credential inputs set, the step logs that publishing was skipped. Setting only some of them (for example just the Confluence token) fails visibly instead.
 
 ## Editing, freshness and delivery
 

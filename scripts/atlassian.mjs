@@ -184,7 +184,13 @@ export async function publishAtlassianRelease({email, token, confluenceToken, de
     requireValue(pages.length <= 1 && pages.every(page => ID.test(String(page.id))), `Confluence: ${step} returned an ambiguous or invalid page`);
     return pages[0] || null;
   };
-  // Titles are unique per space. A concurrent run may create the page first: then use that one.
+  // Titles are unique per space, so a page with this title elsewhere in the space is someone
+  // else's: never reuse or overwrite it. Only a page under the expected parent is ours.
+  const owned = (name, title, parentId, page) => {
+    requireValue(String(page.parentId) === String(parentId), `Confluence: a page titled "${title}" already exists outside "${name === 'repository page' ? plan.rootTitle : plan.repoTitle}"; rename or move it, then rerun`);
+    return page;
+  };
+  // A concurrent run may create the page first: then use that one.
   const ensure = async (name, title, parentId, value, update) => {
     let page = await find(`find ${name}`, title);
     if (!page) {
@@ -196,9 +202,20 @@ export async function publishAtlassianRelease({email, token, confluenceToken, de
         if (![400, 409].includes(error.status) || !(page = await find(`find ${name}`, title))) throw error;
       }
     }
+    owned(name, title, parentId, page);
     if (!update) return page;
-    requireValue(Number.isSafeInteger(page.version?.number), `Confluence: ${name} has no version number`);
-    return api.wiki(`update ${name}`, `/api/v2/pages/${page.id}`, {method: 'PUT', body: {id: String(page.id), status: 'current', title, body: {representation: 'storage', value}, version: {number: page.version.number + 1, message: 'Updated from the production deploy'}}});
+    // A concurrent run may update it between our read and write (HTTP 409): reread and retry.
+    for (let attempt = 1; ; attempt++) {
+      requireValue(Number.isSafeInteger(page.version?.number), `Confluence: ${name} has no version number`);
+      try {
+        return await api.wiki(`update ${name}`, `/api/v2/pages/${page.id}`, {method: 'PUT', body: {id: String(page.id), status: 'current', title, body: {representation: 'storage', value}, version: {number: page.version.number + 1, message: 'Updated from the production deploy'}}});
+      } catch (error) {
+        if (error.status !== 409 || attempt >= 3) throw error;
+      }
+      page = await find(`find ${name}`, title);
+      requireValue(page, `Confluence: ${name} disappeared during update`);
+      owned(name, title, parentId, page);
+    }
   };
   const root = await find('find root page', plan.rootTitle);
   requireValue(root, `Confluence: root page "${plan.rootTitle}" not found in space ${plan.space}; create it first`);
@@ -222,8 +239,11 @@ export async function publishAtlassianRelease({email, token, confluenceToken, de
     catch (error) { if (error.status !== 400 || !(release = await named())) throw error; }
   }
   requireValue(ID.test(String(release?.id)), 'Jira: invalid release response');
+  // Jira can accept edits that add an archived version and then not apply them, so never use one.
+  requireValue(release.archived !== true, `Jira: release "${plan.versionName}" is archived; unarchive it in ${plan.project} › Releases, then rerun`);
   if (Object.entries(wanted).some(([field, value]) => release[field] !== value)) {
     release = await api.jira('update release', `/version/${release.id}`, {method: 'PUT', body: wanted});
+    requireValue(ID.test(String(release?.id)) && release.archived !== true && release.released === true, 'Jira: update release returned an unexpected release');
   }
 
   const warnings = [], targets = [];

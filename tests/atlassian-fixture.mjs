@@ -12,8 +12,11 @@ const JIRA = `https://api.atlassian.com/ex/jira/${CLOUD}/rest/api/3`, WIKI = `ht
  * search with 400, as Jira's JQL validation does. race: the first create of each page/version
  * loses to a concurrent run (the object appears, the request gets 400). fail: {'METHOD path-prefix': status}.
  * wikiToken: the token Confluence requests must carry (scoped tokens cover one app).
+ * raceParent: with race, the concurrent run's page lands under this parent instead. beforeUpdate(page):
+ * called before a page update is applied, to simulate another run writing in between. Archived versions
+ * answer issue edits with 204 but are not added, as Jira does (JRACLOUD-76263).
  */
-export function atlassianFake({pages = [{id: '1', title: 'Release notes', parentId: null}], versions = [], issues = {}, strictJql = false, race = false, fail = {}, wikiToken = TOKEN} = {}) {
+export function atlassianFake({pages = [{id: '1', title: 'Release notes', parentId: null}], versions = [], issues = {}, strictJql = false, race = false, raceParent = null, fail = {}, wikiToken = TOKEN, beforeUpdate = null} = {}) {
   const state = {pages: pages.map(page => ({spaceId: '100', status: 'current', version: {number: 1}, labels: [], body: '', ...page})),
     versions: versions.map(version => ({projectId: 10000, ...version})), issues: structuredClone(issues)};
   const calls = [], raced = new Set();
@@ -32,7 +35,7 @@ export function atlassianFake({pages = [{id: '1', title: 'Release notes', parent
       assert.equal(body.spaceId, '100'); assert.equal(body.status, 'current'); assert.equal(body.body.representation, 'storage');
       assert.ok(state.pages.some(page => page.id === body.parentId), 'Parent page must exist');
       const page = {id: String(nextId++), title: body.title, parentId: body.parentId, spaceId: '100', status: 'current', version: {number: 1}, labels: [], body: body.body.value};
-      if (race && !raced.has(body.title)) { raced.add(body.title); state.pages.push({...page, body: 'created by a concurrent run'}); return [400, {message: 'A page with this title already exists'}]; }
+      if (race && !raced.has(body.title)) { raced.add(body.title); state.pages.push({...page, ...(raceParent ? {parentId: raceParent} : {}), body: 'created by a concurrent run'}); return [400, {message: 'A page with this title already exists'}]; }
       if (state.pages.some(existing => existing.title === body.title)) return [400, {message: 'A page with this title already exists'}];
       state.pages.push(page);
       return {...page, labels: undefined, body: undefined};
@@ -42,6 +45,7 @@ export function atlassianFake({pages = [{id: '1', title: 'Release notes', parent
       assert.ok(page, 'Updating a missing page');
       assert.deepEqual(Object.keys(body).sort(), ['body', 'id', 'status', 'title', 'version']);
       assert.equal(body.id, page.id); assert.equal(body.body.representation, 'storage');
+      beforeUpdate?.(page);
       if (body.version.number !== page.version.number + 1) return [409, {message: 'Version conflict'}];
       Object.assign(page, {title: body.title, body: body.body.value, version: {number: body.version.number}});
       return {id: page.id, title: page.title, version: page.version};
@@ -84,6 +88,7 @@ export function atlassianFake({pages = [{id: '1', title: 'Release notes', parent
       assert.deepEqual(Object.keys(body), ['update']); assert.deepEqual(Object.keys(body.update), ['fixVersions']);
       const {id} = body.update.fixVersions[0].add;
       assert.ok(state.versions.some(version => version.id === id), 'Fix version must exist');
+      if (state.versions.find(version => version.id === id).archived) return [204, null];
       issue.fixVersions = [...new Set([...(issue.fixVersions || []), id])];
       return [204, null];
     }

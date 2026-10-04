@@ -829,6 +829,9 @@ test('notification CLI: Jira release and Confluence page only for successful pro
   const half = setup();
   await assert.rejects(main({...env, ATLASSIAN_API_TOKEN: ''}, {...quiet, fetch: half.fetch}), /^Error: Atlassian release not published: ATLASSIAN_API_TOKEN is required$/);
   assert.deepEqual(half.order, ['jira-webhook']);
+  const lone = setup();
+  await assert.rejects(main({...env, ATLASSIAN_EMAIL: '', ATLASSIAN_API_TOKEN: '', ATLASSIAN_CONFLUENCE_API_TOKEN: 'ATATT-confluence-only'}, {...quiet, fetch: lone.fetch}), /^Error: Atlassian release not published: ATLASSIAN_EMAIL must be the service account email address$/);
+  assert.deepEqual(lone.order, ['jira-webhook']);
   // Staging and failed deploys never validate or call Atlassian, even with a broken configuration.
   for (const extra of [{ENVIRONMENT: 'staging'}, {DEPLOY_STATUS: 'failure', DEPLOYED_SHA: '', VERSION: ''}]) {
     const other = setup();

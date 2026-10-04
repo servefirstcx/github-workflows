@@ -101,6 +101,58 @@ test('a concurrent run that creates the pages or version first is reused, not du
   assert.equal(fake.state.versions[0].released, true);
 });
 
+test('a same-title page outside the release tree is never reused or overwritten', async () => {
+  const human = {id: '9', title: 'Team pages', parentId: null};
+  for (const misplaced of [{id: '3', title: 'sf-api 4.26.0', parentId: '9', body: 'Human notes'}, {id: '2', title: 'sf-api release notes', parentId: '9', body: 'Human notes'}]) {
+    const fake = atlassianFake({issues: issues(), pages: [{id: '1', title: 'Release notes', parentId: null}, human, ...(misplaced.id === '3' ? [{id: '2', title: 'sf-api release notes', parentId: '1'}] : []), misplaced]});
+    await assert.rejects(a.publishAtlassianRelease(options(fake)), new RegExp(`^Error: Confluence: a page titled "${misplaced.title}" already exists outside "${misplaced.id === '3' ? 'sf-api release notes' : 'Release notes'}"; rename or move it, then rerun$`));
+    assert.deepEqual(fake.writes(), []);
+    assert.equal(fake.state.pages.find(item => item.id === misplaced.id).body, 'Human notes');
+    assert.equal(fake.state.versions.length, 0);
+  }
+  // Also when a concurrent create puts the page somewhere else.
+  const raced = atlassianFake({issues: issues(), race: true, raceParent: '9', pages: [{id: '1', title: 'Release notes', parentId: null}, human]});
+  await assert.rejects(a.publishAtlassianRelease(options(raced)), /^Error: Confluence: a page titled "sf-api release notes" already exists outside "Release notes"/);
+  assert.deepEqual(raced.writes(), ['POST wiki/api/v2/pages']);
+});
+
+test('an archived Jira release is refused before any ticket is edited', async () => {
+  const fake = atlassianFake({issues: issues(), versions: [{id: '77', name: 'sf-api 4.26.0', released: true, archived: true, releaseDate: '2026-10-03'}]});
+  await assert.rejects(a.publishAtlassianRelease(options(fake)), /^Error: Jira: release "sf-api 4.26.0" is archived; unarchive it in SF › Releases, then rerun$/);
+  assert.ok(!fake.writes().some(call => call.startsWith('PUT jira/')));
+  assert.ok(Object.values(fake.state.issues).every(issue => !issue.fixVersions?.length));
+});
+
+test('a page updated by another run between read and write is reread and retried, within a limit', async () => {
+  let bumps = 1;
+  const fake = atlassianFake({issues: issues(), beforeUpdate: item => { if (item.title === 'sf-api 4.26.0' && bumps-- > 0) item.version.number++; }});
+  await a.publishAtlassianRelease(options(fake));
+  bumps = 1;
+  const result = await a.publishAtlassianRelease(options(fake));
+  assert.equal(page(fake, 'sf-api 4.26.0').version.number, 3);
+  assert.match(page(fake, 'sf-api 4.26.0').body, /Tickets shipped/);
+  assert.deepEqual(result.fixVersions, {added: 0, already: 2, skipped: 2});
+  // Two real publishers sharing one site both succeed.
+  const shared = atlassianFake({issues: issues()});
+  await a.publishAtlassianRelease(options(shared));
+  const outcomes = await Promise.allSettled([a.publishAtlassianRelease(options(shared)), a.publishAtlassianRelease(options(shared))]);
+  assert.deepEqual(outcomes.map(outcome => outcome.status), ['fulfilled', 'fulfilled']);
+  assert.equal(page(shared, 'sf-api 4.26.0').version.number, 3);
+  // A page moved out of the tree while we retry is not overwritten.
+  let moved = false;
+  const moving = atlassianFake({issues: issues(), pages: [{id: '1', title: 'Release notes', parentId: null}, {id: '9', title: 'Team pages', parentId: null}],
+    beforeUpdate: item => { if (item.title === 'sf-api 4.26.0' && moving.state.versions.length && !moved) { moved = true; item.version.number++; item.parentId = '9'; item.body = 'Human notes'; } }});
+  await a.publishAtlassianRelease(options(moving));
+  await assert.rejects(a.publishAtlassianRelease(options(moving)), /^Error: Confluence: a page titled "sf-api 4.26.0" already exists outside "sf-api release notes"/);
+  assert.equal(page(moving, 'sf-api 4.26.0').body, 'Human notes');
+  // A page that keeps changing still fails visibly after three tries.
+  const busy = atlassianFake({issues: issues(), beforeUpdate: item => { if (item.title === 'sf-api 4.26.0') item.version.number++; }});
+  await a.publishAtlassianRelease(options(busy)).catch(() => {});
+  const before = busy.calls.length;
+  await assert.rejects(a.publishAtlassianRelease(options(busy)), /^Error: Confluence: update version page failed \(HTTP 409\)$/);
+  assert.equal(busy.calls.slice(before).filter(call => call.key.startsWith('PUT wiki/')).length, 3);
+});
+
 test('a key Jira search rejects falls back to one search per key (no extra token scopes) with the same result', async () => {
   const strict = atlassianFake({issues: issues(), strictJql: true}), lenient = atlassianFake({issues: issues()});
   const result = await a.publishAtlassianRelease(options(strict));

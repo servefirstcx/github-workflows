@@ -7,7 +7,8 @@ import {DEFAULT_CLOUD_ID, previewAtlassianRelease, publishAtlassianRelease} from
 export async function main(env = process.env, {fetch = globalThis.fetch, log = console.log, warn = console.warn, now} = {}) {
   if (env.DRY_RUN && !['true', 'false'].includes(env.DRY_RUN)) throw new Error('DRY_RUN must be true or false');
   const dryRun = env.DRY_RUN === 'true';
-  const atlassianConfigured = Boolean(env.ATLASSIAN_EMAIL || env.ATLASSIAN_API_TOKEN);
+  // Any credential counts, so a partial setup fails visibly instead of being skipped.
+  const atlassianConfigured = Boolean(env.ATLASSIAN_EMAIL || env.ATLASSIAN_API_TOKEN || env.ATLASSIAN_CONFLUENCE_API_TOKEN);
   if (!env.SLACK_WEBHOOK_URL && !env.JIRA_WEBHOOK_URL && !atlassianConfigured && !dryRun) {
     log('Deployment notification skipped: no optional Slack, Jira or Atlassian configuration.');
     return {sent: false, skipped: true};
