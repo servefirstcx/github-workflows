@@ -93,6 +93,12 @@ on:
       JIRA_RELEASE_WEBHOOK_SECRET:
         description: "Secret for JIRA_RELEASE_WEBHOOK_URL"
         required: false
+      ATLASSIAN_RELEASE_EMAIL:
+        description: "Release bot service account email; with ATLASSIAN_RELEASE_TOKEN, production deploys publish the Jira release and Confluence release notes page"
+        required: false
+      ATLASSIAN_RELEASE_TOKEN:
+        description: "API token for ATLASSIAN_RELEASE_EMAIL"
+        required: false
 
 permissions:
   id-token: write
@@ -444,3 +450,6 @@ jobs:
           # on the deployment, and the ticket range is computed from those records.
           jira-webhook-url: ${{ needs.setup.outputs.environment == 'production' && needs.setup.outputs.deployed_sha == github.sha && secrets.JIRA_RELEASE_WEBHOOK_URL || '' }}
           jira-webhook-secret: ${{ secrets.JIRA_RELEASE_WEBHOOK_SECRET }}
+          # Same gate for the Release bot pair: blanking only one would read as a half-configured setup.
+          atlassian-email: ${{ needs.setup.outputs.environment == 'production' && needs.setup.outputs.deployed_sha == github.sha && secrets.ATLASSIAN_RELEASE_EMAIL || '' }}
+          atlassian-api-token: ${{ needs.setup.outputs.environment == 'production' && needs.setup.outputs.deployed_sha == github.sha && secrets.ATLASSIAN_RELEASE_TOKEN || '' }}

@@ -71,7 +71,7 @@ permissions:
   deployments: read
 ```
 
-Granting them before the shared change lands is harmless, so update callers (on every branch that deploys, including the production branch) first. `deploy-ecs.yml` callers use `secrets: inherit`, which already forwards the org secrets `JIRA_RELEASE_WEBHOOK_URL` and `JIRA_RELEASE_WEBHOOK_SECRET`; `deploy-s3-cloudfront.yml` declares them as optional secrets, so a caller that forwards secrets explicitly must add them.
+Granting them before the shared change lands is harmless, so update callers (on every branch that deploys, including the production branch) first. `deploy-ecs.yml` callers use `secrets: inherit`, which already forwards the org secrets `JIRA_RELEASE_WEBHOOK_URL`, `JIRA_RELEASE_WEBHOOK_SECRET`, `ATLASSIAN_RELEASE_EMAIL` and `ATLASSIAN_RELEASE_TOKEN`; `deploy-s3-cloudfront.yml` declares them as optional secrets, so a caller that forwards secrets explicitly must add them. Both shared workflows pass the Jira webhook and the Release bot pair only for production deploys of the triggering commit, so these services also get Jira releases and Engineering › Release notes pages.
 
 ## Marking Jira tickets as released
 
