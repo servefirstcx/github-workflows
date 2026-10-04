@@ -51,7 +51,7 @@ export async function releasedTickets(options) {
   const release = await associatedReleasePR(api, deployedSha, mainBranch, releaseLabel);
   requireValue(release, 'No unique merged release PR for deployed SHA');
   const {base, previous = null, deployedAt, warnings} = await reportingBase(api, deployedSha);
-  if (!base) return {tickets: [], pullRequests: [], reverted: {pullRequests: [], tickets: []}, releasePr: release, base: null, previous: null, deployedAt, warnings};
+  if (!base) return {tickets: [], pullRequests: [], directCommits: [], reverted: {pullRequests: [], tickets: []}, releasePr: release, base: null, previous: null, deployedAt, warnings};
 
   const commits = await rangeCommits(api, base, deployedSha);
   const messages = new Map(commits.map(c => [c.sha, c.commit?.message || '']));
@@ -135,7 +135,21 @@ export async function releasedTickets(options) {
   const tickets = [...keys].filter(key => !dropped.has(key)).sort(), shipped = new Set(tickets);
   const facts = (list, keysOf) => list.sort((a, b) => a.number - b.number).map(pr => ({number: pr.number, title: String(pr.title || ''), author: pr.user?.login || null, mergedAt: pr.merged_at, tickets: keysOf(pr)}));
   const left = pr => revertPrs.has(pr.number) || droppedPrs.has(pr.number);
-  return {tickets, releasePr: release, base, previous, deployedAt, warnings,
+  // Changes that reached production without a PR (e.g. a fix pushed straight to a hotfix branch).
+  // Version bumps, sync and release merges, other merge commits and reverts are bookkeeping, not changes.
+  const releaseMerges = new Set([...releases.values()].map(pr => pr.merge_commit_sha));
+  // Undone work isn't shipped: commits a later revert names, and every commit of a reverted hotfix.
+  const undone = new Set([...messages.values()].flatMap(message => [...message.matchAll(/\bThis reverts commit ([a-f0-9]{40})\b/gi)].map(m => m[1].toLowerCase())));
+  for (const number of droppedPrs) for (const sha of releaseShas.get(number) || []) undone.add(sha);
+  // A fix pushed to a hotfix/SF-1-x branch is covered by that hotfix's tickets (branch name, "Closes" lines).
+  // Not release/* PRs: every commit belongs to the release PR, and its "Closes" lines would hide unlinked commits.
+  const hotfixKeys = sha => [...releaseShas].filter(([number, shas]) => shas.includes(sha) && /^hotfix\//.test(releases.get(number)?.head?.ref || ''))
+    .flatMap(([number]) => shippedTicketKeys({branch: releases.get(number).head.ref, body: String(releases.get(number).body || '').replace(NOTES_BLOCK, '')}));
+  const directCommits = commits.filter(c => !prsOf.get(c.sha)?.size && !syncCommits.has(c.sha) && !revertCommits.has(c.sha) && !releaseMerges.has(c.sha)
+    && !undone.has(c.sha) && (c.parents?.length ?? 1) <= 1 && !/^chore: bump version\b/i.test(messages.get(c.sha)))
+    .map(c => ({sha: c.sha, title: messages.get(c.sha).split('\n')[0], author: c.author?.login || c.commit?.author?.name || null,
+      committedAt: c.commit?.committer?.date || null, tickets: [...new Set([...changeKeys(c.sha), ...hotfixKeys(c.sha)])].filter(key => shipped.has(key)).sort()}));
+  return {tickets, releasePr: release, base, previous, deployedAt, warnings, directCommits,
     pullRequests: facts([...prs.values()].filter(pr => !left(pr)), pr => prKeys(pr).filter(key => shipped.has(key))),
     reverted: {pullRequests: facts([...prs.values()].filter(left), prKeys).map(pr => ({...pr, reason: revertPrs.has(pr.number) ? 'revert' : 'reverted'})),
       tickets: [...keys].filter(key => dropped.has(key)).sort()}};

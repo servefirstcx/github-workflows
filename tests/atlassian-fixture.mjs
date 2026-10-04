@@ -96,6 +96,7 @@ export function atlassianFake({pages = [{id: '1', title: 'Release notes', parent
   };
   const fetch = async (url, init = {}) => {
     assert.ok(url.startsWith(`${JIRA}/`) || url.startsWith(`${WIKI}/`), `Request outside the Atlassian gateway: ${url}`);
+    assert.equal(init.headers['Accept-Language'], 'en-US', 'Atlassian requests must ask for English names');
     assert.equal(init.headers.Authorization, `Basic ${Buffer.from(`${EMAIL}:${url.startsWith(WIKI) ? wikiToken : TOKEN}`).toString('base64')}`);
     assert.equal(init.redirect, 'error'); assert.ok(init.signal);
     const key = `${init.method || 'GET'} ${url.replace(`${JIRA}/`, 'jira/').replace(`${WIKI}/`, 'wiki/')}`;

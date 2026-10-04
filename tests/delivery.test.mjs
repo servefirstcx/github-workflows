@@ -464,6 +464,9 @@ test('released tickets are rebuilt from GitHub since the last production deploy,
   // Not: SF-9/SF-8 (mentions), SF-3 (reverted), SF-90/SF-98 (sync PR), SF-97 (no "Closes"), SF-99 (inside the notes block).
   assert.deepEqual(result.tickets, ['SF-1', 'SF-10', 'SF-11', 'SF-2', 'SF-5', 'SF-6', 'SF-7']);
   assert.deepEqual(result.warnings, []);
+  // Only the hotfix fix commit reached production without a PR: version bumps, the release merge,
+  // sync/merge commits and PR commits are not "direct".
+  assert.deepEqual(result.directCommits.map(c => [c.sha, c.title, c.tickets]), [[sha(2000), 'hotfix: cap export cells', ['SF-5']]]);
   assert.ok(fixture.calls.every(c => c.init.redirect === 'error' && c.init.signal));
 });
 
@@ -574,6 +577,8 @@ test('released tickets: reverting a commit inside a hotfix drops the hotfix bran
   ];
   const result = await d.releasedTickets({...deployOptions, fetch: releaseFixture({range, extra: {'GET /pulls/7': release}}).fetch});
   assert.deepEqual(result.tickets, ['SF-6']);
+  // The reverted fix and its revert are not listed as shipped direct commits.
+  assert.deepEqual(result.directCommits, []);
 });
 
 test('released tickets: a deployed hotfix whose fix was reverted reports nothing', async () => {
@@ -585,8 +590,11 @@ test('released tickets: a deployed hotfix whose fix was reverted reports nothing
   ];
   const result = await d.releasedTickets({...deployOptions, fetch: releaseFixture({range, extra: {'GET /pulls/7': hotfix}}).fetch});
   assert.deepEqual(result.tickets, []);
+  assert.deepEqual(result.directCommits, [], 'Undone hotfix work is not listed as shipped');
   const kept = await d.releasedTickets({...deployOptions, fetch: releaseFixture({range: [range[0], range[2]], extra: {'GET /pulls/7': hotfix}}).fetch});
   assert.deepEqual(kept.tickets, ['SF-78']);
+  // A fix on hotfix/SF-78-… is covered by the branch ticket, so it isn't flagged as having no ticket.
+  assert.deepEqual(kept.directCommits.map(c => [c.sha, c.title, c.tickets]), [[sha(8101), 'neutral fix', ['SF-78']]]);
 });
 
 test('released tickets: redeploying an already deployed commit reports nothing; a failed earlier attempt does not count', async () => {
@@ -867,6 +875,6 @@ test('notification CLI dry-run shows the Jira release and Confluence page it wou
     assert.match(body, /<h2>Tickets shipped \(7\)<\/h2>/);
     assert.match(body, /Not fetched \(dry run\)/);
   } finally { await rm(directory, {recursive: true, force: true}); }
-  assert.ok(logs.some(line => line.startsWith('Atlassian dry-run: would publish Confluence page "repo 1.2" (Eng › Release notes › repo release notes; labels release-notes, repo-repo) with 7 ticket(s), 3 PR(s) and 2 reverted PR(s) left out.')));
+  assert.ok(logs.some(line => line.startsWith('Atlassian dry-run: would publish Confluence page "repo 1.2" (Eng › Release notes › repo release notes; labels release-notes, repo-repo) with 7 ticket(s), 3 PR(s) (0 without a ticket), 1 direct commit(s) and 2 reverted PR(s) left out.')));
   assert.ok(logs.some(line => line === 'Atlassian dry-run: would release Jira version "repo 1.2" in SF dated 2026-10-03 and add it to 7 SF ticket(s) that exist: SF-1, SF-10, SF-11, SF-2, SF-5, SF-6, SF-7.'));
 });

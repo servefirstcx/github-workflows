@@ -38,7 +38,10 @@ export function createAtlassian({email, token, confluenceToken = token, cloudId 
   requireValue(validToken(token), 'ATLASSIAN_API_TOKEN is required');
   requireValue(validToken(confluenceToken), 'ATLASSIAN_CONFLUENCE_API_TOKEN is invalid');
   requireValue(CLOUD_ID.test(cloudId || ''), 'ATLASSIAN_CLOUD_ID must be an Atlassian cloud ID (UUID)');
-  const headers = secret => ({Authorization: `Basic ${Buffer.from(`${email}:${secret}`).toString('base64')}`, Accept: 'application/json', 'Content-Type': 'application/json'});
+  const headers = secret => ({Authorization: `Basic ${Buffer.from(`${email}:${secret}`).toString('base64')}`, Accept: 'application/json', 'Content-Type': 'application/json',
+    // Through the api.atlassian.com gateway, Jira translates built-in names (issue types) unless asked otherwise:
+    // the first real run rendered Story/Bug/Task in Chinese for the service account.
+    'Accept-Language': 'en-US'});
   const send = async (step, url, {method = 'GET', body, missing = false, secret = token} = {}) => {
     let response;
     try {
@@ -125,16 +128,29 @@ export function renderReleasePage({plan, deployedSha, deployedAt, notesUrl, rele
     ['Previous production commit', previous ? commit(previous) : 'None recorded (first production deploy; range is this release PR only)'],
     ['Range', link(`${gh}/compare/${base}...${deployedSha}`, `${base.slice(0, 7)}...${deployedSha.slice(0, 7)}`)],
   ];
-  const issue = key => issues === null ? ['Not fetched (dry run)', '', ''] : issues.has(key) ? [issues.get(key).summary, issues.get(key).type, issues.get(key).status] : ['Not found in Jira', '', ''];
+  // No status column: the Jira webhook moves these tickets at the same moment, so a snapshot is stale on arrival.
+  const issue = key => issues === null ? ['Not fetched (dry run)', ''] : issues.has(key) ? [issues.get(key).summary, issues.get(key).type] : ['Not found in Jira', ''];
   const pr = item => [pull(item.number), xml(item.title), xml(item.author || 'unknown'), xml(day(item.mergedAt)), keys(item.tickets || [])];
   const left = released.reverted || {pullRequests: [], tickets: []};
+  const direct = released.directCommits || [];
+  const directRow = item => [commit(item.sha), xml(item.title), xml(item.author || 'unknown'), xml(day(item.committedAt)), keys(item.tickets || [])];
+  // Shipped work no ticket gets credit for: PRs without a ticket, and direct commits without one.
+  const unlinked = [...released.pullRequests.filter(item => !(item.tickets || []).length).map(item => [pull(item.number), ...pr(item).slice(1, 4)]),
+    ...direct.filter(item => !(item.tickets || []).length).map(item => directRow(item).slice(0, 4))];
+  const linkedCount = released.pullRequests.filter(item => (item.tickets || []).length).length;
+  details.push(['Pull requests', xml(`${released.pullRequests.length} (${linkedCount} linked to tickets, ${released.pullRequests.length - linkedCount} without)`)]);
+  if (direct.length) details.push(['Commits without a pull request', xml(String(direct.length))]);
   return [
     '<h2>Details</h2>',
     `<table><tbody>${details.map(([name, value]) => `<tr><th>${xml(name)}</th><td>${value}</td></tr>`).join('')}</tbody></table>`,
+    ...(unlinked.length ? [`<h2>Shipped without a ticket (${unlinked.length})</h2>`,
+      '<p>These changes reached production but no Jira ticket gets credit for them. Name branches after the ticket (SF-123-…) or add a "Closes SF-123" line.</p>',
+      table(['Change', 'Title', 'Author', 'Date (UTC)'], unlinked)] : []),
     `<h2>Tickets shipped (${released.tickets.length})</h2>`,
-    released.tickets.length ? table(['Key', 'Summary', 'Type', 'Status'], released.tickets.map(key => [keys([key]), ...issue(key).map(xml)])) : '<p>No tickets.</p>',
+    released.tickets.length ? table(['Key', 'Summary', 'Type'], released.tickets.map(key => [keys([key]), ...issue(key).map(xml)])) : '<p>No tickets.</p>',
     `<h2>Pull requests (${released.pullRequests.length})</h2>`,
     released.pullRequests.length ? table(['PR', 'Title', 'Author', 'Merged (UTC)', 'Tickets'], released.pullRequests.map(pr)) : '<p>No pull requests.</p>',
+    ...(direct.length ? [`<h2>Commits without a pull request (${direct.length})</h2>`, table(['Commit', 'Title', 'Author', 'Committed (UTC)', 'Tickets'], direct.map(directRow))] : []),
     ...(left.pullRequests.length || left.tickets.length ? ['<h2>Left out (reverted)</h2>', `<p>Tickets left out: ${left.tickets.length ? keys(left.tickets) : 'none'}</p>`,
       ...(left.pullRequests.length ? [table(['PR', 'Title', 'Author', 'Merged (UTC)', 'Tickets', 'Reason'], left.pullRequests.map(item => [...pr(item), xml(item.reason)]))] : [])] : []),
     '<p><em>Generated automatically from the production deploy. Facts only.</em></p>',
@@ -154,7 +170,7 @@ export function previewAtlassianRelease({deployedSha, notesUrl, released, now = 
   if (!released.base) return {plan, lines: ['Atlassian dry-run: no new production range; nothing would be published.']};
   const deployedAt = deployTime(released, now), own = released.tickets.filter(key => key.startsWith(`${plan.project}-`));
   return {plan, body: renderReleasePage({plan, deployedSha, deployedAt, notesUrl, released}), lines: [
-    `Atlassian dry-run: would publish Confluence page "${plan.pageTitle}" (${plan.space} › ${plan.rootTitle} › ${plan.repoTitle}; labels ${plan.labels.join(', ')}) with ${released.tickets.length} ticket(s), ${released.pullRequests.length} PR(s) and ${released.reverted.pullRequests.length} reverted PR(s) left out.`,
+    `Atlassian dry-run: would publish Confluence page "${plan.pageTitle}" (${plan.space} › ${plan.rootTitle} › ${plan.repoTitle}; labels ${plan.labels.join(', ')}) with ${released.tickets.length} ticket(s), ${released.pullRequests.length} PR(s) (${released.pullRequests.filter(item => !(item.tickets || []).length).length} without a ticket), ${(released.directCommits || []).length} direct commit(s) and ${released.reverted.pullRequests.length} reverted PR(s) left out.`,
     `Atlassian dry-run: would release Jira version "${plan.versionName}" in ${plan.project} dated ${deployedAt.slice(0, 10)} and add it to ${own.length} ${plan.project} ticket(s) that exist${own.length ? `: ${own.join(', ')}` : ''}.`,
   ]};
 }
