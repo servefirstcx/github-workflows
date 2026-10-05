@@ -1,5 +1,11 @@
 name: Reusable Sync Release Workflow
 
+# After a release or hotfix is tagged, bring main back into stage as a real merge commit.
+# The normal path opens no PR: the workflow merges main into stage itself and pushes it with
+# RELEASE_TOKEN, so nobody can pick "Squash and merge" by mistake, and there is no PR whose
+# source branch (main) "delete branch on merge" could remove. A PR for a lead is opened only
+# when the merge has conflicts, or when it can't be pushed.
+
 on:
   workflow_call:
     inputs:
@@ -15,7 +21,7 @@ on:
         default: "main"
     secrets:
       RELEASE_TOKEN:
-        description: "PAT with repo+workflow scopes for creating and auto-merging the sync PR"
+        description: "Token allowed to push to the staging branch (contents + workflows write). Without it a sync PR is opened for a lead to merge"
         required: false
 
 permissions:
@@ -32,142 +38,137 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # git push uses this token. GITHUB_TOKEN cannot push to a protected staging branch.
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
 
       - name: Get version from tag
         id: get_version
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
-          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
-          echo "📦 Syncing release v$VERSION back to ${{ inputs.staging_branch }}"
-
-      - name: Create labels if they don't exist
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "📦 Syncing release v$VERSION back to $STAGING_BRANCH"
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "📌 Ensuring required labels exist..."
+          STAGING_BRANCH: ${{ inputs.staging_branch }}
 
-          # Create 'release-sync' label if it doesn't exist
-          gh label create "release-sync" \
-            --description "PR to sync release back to staging" \
-            --color "0052CC" \
-            --force || echo "Label 'release-sync' already exists"
-
-          # Create 'automated' label if it doesn't exist  
-          gh label create "automated" \
-            --description "Automated PR" \
-            --color "EDEDED" \
-            --force || echo "Label 'automated' already exists"
-
-          echo "✅ Labels ready"
-
-      - name: Create Pull Request
-        id: create-pr
+      - name: Merge main into stage
+        id: sync
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          MAIN_BRANCH: ${{ inputs.main_branch }}
+          STAGING_BRANCH: ${{ inputs.staging_branch }}
+          VERSION: ${{ steps.get_version.outputs.VERSION }}
+          HAS_RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN != '' }}
         run: |
-          # Create PR body with proper formatting
-          cat > pr_body.md << 'EOF'
-          ## 🔄 Release Sync
-
-          This PR automatically syncs the release v${{ steps.get_version.outputs.VERSION }} from `${{ inputs.main_branch }}` back to `${{ inputs.staging_branch }}`.
-
-          ### Why is this needed?
-          - Keeps `${{ inputs.staging_branch }}` up-to-date with production releases
-          - Ensures version numbers stay in sync
-          - Prevents merge conflicts in future releases
-
-          ### What's included?
-          - Version bump to ${{ steps.get_version.outputs.VERSION }}
-          - Any hotfixes or changes made during the release process
-          - The tagged commit from production
-
-          ---
-          *This PR was automatically created after tagging release v${{ steps.get_version.outputs.VERSION }}*
-          EOF
-
-          PR_URL=$(gh pr create \
-            --base "${{ inputs.staging_branch }}" \
-            --head "${{ inputs.main_branch }}" \
-            --title "🔄 Sync Release v${{ steps.get_version.outputs.VERSION }} back to ${{ inputs.staging_branch }}" \
-            --body-file pr_body.md \
-            --label "release-sync" \
-            --label "automated" 2>&1 || echo "PR_CREATE_FAILED")
-
-          if [ "$PR_URL" = "PR_CREATE_FAILED" ] || [ -z "$PR_URL" ]; then
-            echo "ℹ️ Could not create PR - likely already exists or branches are up to date"
-            # Check if PR already exists
-            EXISTING_PR=$(gh pr list --base "${{ inputs.staging_branch }}" --head "${{ inputs.main_branch }}" --json number --jq '.[0].number' || echo "")
-            if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
-              echo "✅ Found existing PR #$EXISTING_PR"
-              echo "PR_NUMBER=$EXISTING_PR" >> $GITHUB_OUTPUT
-            else
-              echo "ℹ️ No sync needed - branches may already be in sync"
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Retries only cover the staging branch moving between fetch and push.
+          for attempt in 1 2 3; do
+            git fetch --no-tags origin "+refs/heads/$MAIN_BRANCH:refs/remotes/origin/$MAIN_BRANCH" "+refs/heads/$STAGING_BRANCH:refs/remotes/origin/$STAGING_BRANCH"
+            if git merge-base --is-ancestor "origin/$MAIN_BRANCH" "origin/$STAGING_BRANCH"; then
+              echo "✅ $STAGING_BRANCH already contains $MAIN_BRANCH"
+              echo "result=in-sync" >> "$GITHUB_OUTPUT"
+              exit 0
             fi
-          else
-            echo "✅ Created PR: $PR_URL"
-            # Extract PR number from URL for next step
-            PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$')
-            echo "PR_NUMBER=$PR_NUMBER" >> $GITHUB_OUTPUT
-          fi
+            if [ "$HAS_RELEASE_TOKEN" != "true" ]; then
+              echo "result=no-token" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            git checkout -q --detach "origin/$STAGING_BRANCH"
+            if ! git merge --no-ff --no-edit -m "🔄 Sync release v$VERSION from $MAIN_BRANCH back to $STAGING_BRANCH" "origin/$MAIN_BRANCH"; then
+              git merge --abort
+              echo "result=conflict" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if git push origin "HEAD:refs/heads/$STAGING_BRANCH"; then
+              echo "✅ Merged $MAIN_BRANCH into $STAGING_BRANCH as a merge commit ($(git rev-parse --short HEAD))"
+              echo "result=merged" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "⏳ Push attempt $attempt was rejected; fetching $STAGING_BRANCH again"
+            sleep $((attempt * 5))
+          done
+          echo "result=push-failed" >> "$GITHUB_OUTPUT"
 
-      - name: Merge sync PR
-        if: steps.create-pr.outputs.PR_NUMBER
-        id: merge-pr
-        continue-on-error: true
+      - name: Open sync PR for a lead
+        id: create-pr
+        if: contains(fromJSON('["conflict", "no-token", "push-failed"]'), steps.sync.outputs.result)
         env:
-          # Only attempt --admin merge when RELEASE_TOKEN (admin PAT) is available.
-          # GITHUB_TOKEN lacks admin bypass capability and would silently fail.
-          MERGE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          MAIN_BRANCH: ${{ inputs.main_branch }}
+          STAGING_BRANCH: ${{ inputs.staging_branch }}
+          VERSION: ${{ steps.get_version.outputs.VERSION }}
+          RESULT: ${{ steps.sync.outputs.result }}
         run: |
-          if [ -z "$MERGE_TOKEN" ]; then
-            echo "⚠️ RELEASE_TOKEN not set — skipping auto-merge, PR will need manual merge"
-            echo "merged=false" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          case "$RESULT" in
+            conflict) REASON="merging \`$MAIN_BRANCH\` into \`$STAGING_BRANCH\` has conflicts" ;;
+            no-token) REASON="this repository's sync workflow does not pass \`RELEASE_TOKEN\`, so it cannot push to \`$STAGING_BRANCH\`" ;;
+            *) REASON="pushing the merge to \`$STAGING_BRANCH\` was rejected" ;;
+          esac
+          echo "::warning::Release v$VERSION was not synced back to $STAGING_BRANCH automatically: ${REASON//\`/}. A sync PR is open for a lead."
+
+          gh label create "release-sync" --description "PR to sync release back to staging" --color "0052CC" --force
+          gh label create "automated" --description "Automated PR" --color "EDEDED" --force
+
+          {
+            echo "## 🔄 Release sync needs a lead"
+            echo
+            echo "Release v$VERSION was not synced back to \`$STAGING_BRANCH\` automatically: $REASON."
+            echo
+            echo "**Merge this as a merge commit. Never squash it.** Squashing leaves \`$STAGING_BRANCH\` without \`$MAIN_BRANCH\`'s history, and the next release PR then shows old changes and conflicts."
+            echo
+            if [ "$RESULT" = "conflict" ]; then
+              echo "GitHub's conflict editor can't be used here: it would commit to \`$MAIN_BRANCH\`, which is locked. A lead resolves it locally:"
+            else
+              echo "A lead can use **Create a merge commit** on this PR, or merge locally:"
+            fi
+            echo
+            echo '```bash'
+            echo "git fetch origin"
+            echo "git checkout $STAGING_BRANCH && git pull"
+            echo "git merge --no-ff origin/$MAIN_BRANCH   # resolve any conflicts, then commit"
+            echo "git push origin $STAGING_BRANCH         # leads and admins only"
+            echo '```'
+            echo
+            echo "Pushing the merge closes this PR automatically."
+          } > pr_body.md
+
+          EXISTING_PR=$(gh pr list --base "$STAGING_BRANCH" --head "$MAIN_BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING_PR" ]; then
+            echo "✅ Sync PR #$EXISTING_PR is already open"
+            echo "PR_NUMBER=$EXISTING_PR" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
-          echo "🔀 Merging sync PR #${{ steps.create-pr.outputs.PR_NUMBER }}..."
-
-          # Retry up to 5 times with backoff — PR may not be mergeable immediately after creation
-          MERGED=false
-          for i in 1 2 3 4 5; do
-            if GH_TOKEN="$MERGE_TOKEN" gh pr merge ${{ steps.create-pr.outputs.PR_NUMBER }} --merge --admin 2>&1; then
-              echo "✅ Sync PR merged automatically (attempt $i)"
-              MERGED=true
-              break
-            fi
-            echo "⏳ Attempt $i failed, retrying in ${i}0s..."
-            sleep $((i * 10))
-          done
-
-          if [ "$MERGED" = "true" ]; then
-            echo "merged=true" >> $GITHUB_OUTPUT
-          else
-            echo "⚠️ Auto-merge failed after 5 attempts — PR will need manual merge"
-            echo "merged=false" >> $GITHUB_OUTPUT
-          fi
+          PR_URL=$(gh pr create \
+            --base "$STAGING_BRANCH" \
+            --head "$MAIN_BRANCH" \
+            --title "🔄 Sync Release v$VERSION back to $STAGING_BRANCH" \
+            --body-file pr_body.md \
+            --label "release-sync" \
+            --label "automated")
+          echo "✅ Created PR: $PR_URL"
+          echo "PR_NUMBER=${PR_URL##*/}" >> "$GITHUB_OUTPUT"
 
       - name: Add summary
+        env:
+          MAIN_BRANCH: ${{ inputs.main_branch }}
+          STAGING_BRANCH: ${{ inputs.staging_branch }}
+          VERSION: ${{ steps.get_version.outputs.VERSION }}
+          RESULT: ${{ steps.sync.outputs.result }}
+          PR_NUMBER: ${{ steps.create-pr.outputs.PR_NUMBER }}
         run: |
-          echo "## 🔄 Release Sync Status" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          if [ -n "${{ steps.create-pr.outputs.PR_NUMBER }}" ]; then
-            echo "### Pull Request #${{ steps.create-pr.outputs.PR_NUMBER }}" >> $GITHUB_STEP_SUMMARY
-            echo "A PR has been created to sync release v${{ steps.get_version.outputs.VERSION }} back to ${{ inputs.staging_branch }}." >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "[View Pull Request](https://github.com/${{ github.repository }}/pull/${{ steps.create-pr.outputs.PR_NUMBER }})" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            
-            if [ "${{ steps.merge-pr.outputs.merged }}" = "true" ]; then
-              echo "✅ **Merged automatically** - Sync PR has been merged" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "⚠️ **Manual merge required** - Please review and merge the PR" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "This usually means:" >> $GITHUB_STEP_SUMMARY
-              echo "- There might be merge conflicts to resolve" >> $GITHUB_STEP_SUMMARY
-              echo "- Branch protection rules require reviews" >> $GITHUB_STEP_SUMMARY
-              echo "- Or checks need to pass first" >> $GITHUB_STEP_SUMMARY
-            fi
-          else
-            echo "ℹ️ No PR needed - branches are already in sync or a PR already exists." >> $GITHUB_STEP_SUMMARY
-          fi
+          {
+            echo "## 🔄 Release Sync Status"
+            echo
+            case "$RESULT" in
+              merged) echo "✅ **Merged automatically.** v$VERSION was merged from \`$MAIN_BRANCH\` into \`$STAGING_BRANCH\` as a merge commit." ;;
+              in-sync) echo "ℹ️ \`$STAGING_BRANCH\` already contains \`$MAIN_BRANCH\`. Nothing to sync." ;;
+              *)
+                echo "⚠️ **A lead needs to merge the sync.** It was not done automatically ($RESULT)."
+                if [ -n "$PR_NUMBER" ]; then
+                  echo
+                  echo "[Sync PR #$PR_NUMBER](https://github.com/$GITHUB_REPOSITORY/pull/$PR_NUMBER): merge it as a merge commit, never squash."
+                fi
+                ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"

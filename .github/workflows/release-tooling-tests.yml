@@ -24,6 +24,7 @@ jobs:
         run: >-
           "$(go env GOPATH)/bin/actionlint" -shellcheck=
           .github/workflows/release.yml
+          .github/workflows/sync-release.yml
           .github/workflows/tag-release.yml
           .github/workflows/refresh-release-notes.yml
           .github/workflows/release-tooling-tests.yml
