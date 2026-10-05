@@ -732,7 +732,12 @@ test('Jira webhook requires current endpoint and secret, batches, and never leak
   assert.deepEqual(result, {sent: true, skipped: false, tickets: 120});
   assert.deepEqual(posts.map(p => p.body.issues.length), [50, 50, 20]);
   assert.deepEqual(posts.flatMap(p => p.body.issues), tickets);
-  assert.deepEqual(posts[0].body.data, {repository: 'org/repo', version: '1.2', notesUrl: 'https://github.com/org/repo/pull/7'});
+  assert.deepEqual(posts[0].body.data, {repository: 'org/repo', version: '1.2', notesUrl: 'https://github.com/org/repo/pull/7', releaseType: 'release'});
+  const hotfixPosts = [];
+  await d.sendJiraRelease({webhook: JIRA_HOOK, secret: 'shh', tickets: ['SF-1'], repository: 'org/repo', version: '1.2.1', notesUrl: null, releaseType: 'hotfix',
+    fetch: async (url, init) => { hotfixPosts.push(JSON.parse(init.body)); return new Response('{}'); }});
+  assert.equal(hotfixPosts[0].data.releaseType, 'hotfix');
+  await assert.rejects(d.sendJiraRelease({webhook: JIRA_HOOK, secret: 'shh', tickets: ['SF-1'], releaseType: 'anything', fetch: () => assert.fail('Bad type fetched')}), /Invalid release type/);
   assert.equal(posts[0].init.headers['X-Automation-Webhook-Token'], 'shh');
   assert.equal(posts[0].init.redirect, 'error');
   assert.ok(posts[0].init.signal);
@@ -760,6 +765,7 @@ test('notification CLI: Jira only for successful production, independent of Slac
   const result = await main(env, {fetch: jiraOnly.fetch, ...quiet});
   assert.equal(result.jira.sent, true);
   assert.deepEqual(jiraOnly.jira.map(b => b.issues), [['SF-1', 'SF-10', 'SF-11', 'SF-2', 'SF-5', 'SF-6', 'SF-7']]);
+  assert.deepEqual(jiraOnly.jira.map(b => b.data.releaseType), ['release'], 'A release/* deploy is reported as a release');
   assert.equal(jiraOnly.jira[0].data.notesUrl, 'https://github.com/org/repo/pull/7');
   const slackDown = withPosts(500);
   await assert.rejects(main({...env, SLACK_WEBHOOK_URL: 'https://hooks.slack.com/services/T1/B2/S3'}, {fetch: slackDown.fetch, ...quiet}), /Slack delivery failed/);

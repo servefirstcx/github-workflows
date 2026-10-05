@@ -58,7 +58,8 @@ export async function main(env = process.env, {fetch = globalThis.fetch, log = c
   }
   if (jiraEligible && released) {
     try {
-      jira = await sendJiraRelease({webhook: env.JIRA_WEBHOOK_URL, secret: env.JIRA_WEBHOOK_SECRET, tickets: released.tickets, repository: env.GITHUB_REPOSITORY, version: env.VERSION, notesUrl: result.notesUrl || `https://github.com/${env.GITHUB_REPOSITORY}/pull/${released.releasePr.number}`, fetch});
+      jira = await sendJiraRelease({webhook: env.JIRA_WEBHOOK_URL, secret: env.JIRA_WEBHOOK_SECRET, tickets: released.tickets, repository: env.GITHUB_REPOSITORY, version: env.VERSION, notesUrl: result.notesUrl || `https://github.com/${env.GITHUB_REPOSITORY}/pull/${released.releasePr.number}`,
+        releaseType: /^hotfix\//.test(released.releasePr?.head?.ref || '') ? 'hotfix' : 'release', fetch});
       // Atlassian can answer 200 even for a wrong secret, so this is not proof the rule ran.
       if (jira.sent) log(`Jira webhook returned success for ${jira.tickets} ticket(s): ${released.tickets.join(', ')}. Check the rule's audit log to confirm it ran.`);
       else log('Jira: no tickets closed by this release (branch name or "Closes KEY"); nothing sent.');

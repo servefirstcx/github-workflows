@@ -84,7 +84,7 @@ Only on a **successful production** deploy, the action rebuilds the list from Gi
 - **Payload:** ticket keys in batches of 50:
 
 ```json
-{"issues": ["SF-4300", "SF-4401"], "data": {"repository": "servefirstcx/sf-api", "version": "4.25.0", "notesUrl": "https://github.com/servefirstcx/sf-api/releases/tag/v4.25.0"}}
+{"issues": ["SF-4300", "SF-4401"], "data": {"repository": "servefirstcx/sf-api", "version": "4.25.0", "notesUrl": "https://github.com/servefirstcx/sf-api/releases/tag/v4.25.0", "releaseType": "release"}}
 ```
 
 Nothing is validated or sent for staging, dev or failed deploys. GitHub holds only the webhook URL and secret, which can do nothing except trigger that one rule. It holds no Jira user credential. What happens to the tickets is defined, and visible, in Jira.
@@ -92,7 +92,7 @@ Nothing is validated or sent for staging, dev or failed deploys. GitHub holds on
 ### Jira rule (SF project)
 
 1. Trigger: *Incoming webhook*, "Issues provided in the webhook HTTP POST body". Copy the URL and secret.
-2. Condition (JQL): `project = SF AND status = "Dev Complete" AND issuetype != Epic`. Only tickets the team has marked Dev Complete move. Other projects, epics and tickets still in progress are ignored. This also covers a ticket split across repositories or PRs: it only moves once someone marks it Dev Complete, so leave it in progress until every part has merged.
+2. Condition (JQL): `project = SF AND issuetype != Epic AND status in ("Dev Complete"{{#if(equals(webhookData.releaseType, "hotfix"))}}, "Ready for Dev", "In Progress"{{/}})`. Normal releases move only tickets the team marked Dev Complete. **Hotfixes** (`releaseType: "hotfix"`, sent when the deployed PR comes from `hotfix/*`) also move Ready for Dev and In Progress tickets, because a hotfix ticket rarely reaches Dev Complete: the `hotfix/x.y.z` branch carries no ticket key, so the branch and merge rules never see it, and a hotfix only reports tickets someone explicitly linked with `Closes`. Other projects and epics are always ignored.
 3. Action: transition to *Done (In Production)*.
 4. Action: comment `Released to production in {{webhookData.repository}} v{{webhookData.version}}: {{webhookData.notesUrl}}` (Jira exposes the POST body's `data` fields directly on `webhookData`; `webhookData.data.*` renders empty).
 

@@ -282,10 +282,13 @@ async function rangeCommits(api, base, head) {
  * is "Issues provided in the webhook HTTP POST body". The Jira rule owns what
  * happens next; this side holds no Jira user credential.
  */
-export async function sendJiraRelease({webhook, secret, tickets = [], repository, version, notesUrl, fetch: fetchImpl = globalThis.fetch}) {
+// releaseType lets the Jira rule treat hotfixes differently: a hotfix ticket rarely reaches Dev Complete
+// (no ticket-named branch), so the rule also moves Ready for Dev / In Progress tickets for hotfixes only.
+export async function sendJiraRelease({webhook, secret, tickets = [], repository, version, notesUrl, releaseType = 'release', fetch: fetchImpl = globalThis.fetch}) {
   requireValue(typeof webhook === 'string' && JIRA_WEBHOOK.test(webhook), 'Invalid Jira automation webhook URL');
   requireValue(typeof secret === 'string' && secret.length > 0 && !/[\x00-\x1f\x7f]/.test(secret), 'Jira automation webhook secret is required');
   requireValue(Array.isArray(tickets) && tickets.every(key => /^[A-Z][A-Z0-9]+-\d+$/.test(key)), 'Invalid Jira ticket keys');
+  requireValue(['release', 'hotfix'].includes(releaseType), 'Invalid release type');
   if (!tickets.length) return {sent: false, skipped: true, tickets: 0};
   const headers = {'Content-Type': 'application/json', 'X-Automation-Webhook-Token': secret};
   let sent = 0;
@@ -293,7 +296,7 @@ export async function sendJiraRelease({webhook, secret, tickets = [], repository
     let response;
     try {
       response = await fetchImpl(webhook, {method: 'POST', redirect: 'error', signal: AbortSignal.timeout(15000), headers,
-        body: JSON.stringify({issues: tickets.slice(index, index + JIRA_BATCH), data: {repository, version, notesUrl: notesUrl || null}})});
+        body: JSON.stringify({issues: tickets.slice(index, index + JIRA_BATCH), data: {repository, version, notesUrl: notesUrl || null, releaseType}})});
     } catch { throw new Error(`Jira delivery failed after ${sent} of ${tickets.length} ticket(s) (network, redirect or timeout); rerun the job to resend`); }
     // Never log response bodies, URLs or the secret.
     if (!response.ok) throw new Error(`Jira delivery failed after ${sent} of ${tickets.length} ticket(s) (HTTP ${response.status}); rerun the job to resend`);
