@@ -15,6 +15,7 @@ function stepScript(file, name) {
 }
 const syncScript = stepScript('sync-release.yml', 'Merge main into stage').replace(/sleep \$\(\(attempt \* 5\)\)/, 'true');
 const backstopScript = stepScript('release.yml', 'Include main history missing from stage');
+const leadPrScript = stepScript('sync-release.yml', 'Open sync PR for a lead');
 
 function repoFixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'sync-release-'));
@@ -138,4 +139,33 @@ test('release backstop: conflicting missing history stops the release with instr
   assert.match(stopped.stdout, /::error::stage is missing 1 commit\(s\) from main and they conflict/);
   assert.equal(f.git(f.runner, 'rev-parse', 'HEAD'), head);
   assert.ok(!existsSync(join(f.runner, '.git', 'MERGE_HEAD')));
+});
+
+test('lead PR: opened even when the token cannot manage labels, and an open one is reused', t => {
+  const root = mkdtempSync(join(tmpdir(), 'sync-lead-pr-'));
+  t.after(() => rmSync(root, {recursive: true, force: true}));
+  const log = join(root, 'gh.log'), output = join(root, 'output'), existing = join(root, 'existing');
+  // A stand-in gh: label commands are refused, as for a GITHUB_TOKEN without issues permission.
+  writeFileSync(join(root, 'gh'), `#!/bin/sh\necho "$*" >> "${log}"\ncase "$1 $2" in\n  "label create"|"pr edit") echo "HTTP 403" >&2; exit 1 ;;\n  "pr list") cat "${existing}" 2>/dev/null; exit 0 ;;\n  "pr create") echo "https://github.com/org/repo/pull/42" ;;\nesac\n`);
+  chmodSync(join(root, 'gh'), 0o755);
+  const open = result => {
+    writeFileSync(output, '');
+    const run = spawnSync('bash', ['-eo', 'pipefail', '-c', leadPrScript], {cwd: root, encoding: 'utf8',
+      env: {...process.env, PATH: `${root}:${process.env.PATH}`, GITHUB_OUTPUT: output, MAIN_BRANCH: 'main', STAGING_BRANCH: 'stage', VERSION: '1.2.1', RESULT: result}});
+    return {...run, output: readFileSync(output, 'utf8'), body: existsSync(join(root, 'pr_body.md')) ? readFileSync(join(root, 'pr_body.md'), 'utf8') : ''};
+  };
+  const opened = open('no-token');
+  assert.equal(opened.status, 0, opened.stderr + opened.stdout);
+  assert.equal(opened.output, 'PR_NUMBER=42\n');
+  assert.match(opened.stdout, /::warning::Release v1\.2\.1 was not synced back to stage automatically/);
+  assert.match(opened.stdout, /::notice::The sync PR was opened without labels/);
+  assert.match(opened.body, /Never squash it/);
+  assert.match(readFileSync(log, 'utf8'), /^pr create --base stage --head main /m);
+  const conflict = open('conflict');
+  assert.match(conflict.body, /conflict editor can't be used/);
+  writeFileSync(existing, '17\n');
+  const reused = open('conflict');
+  assert.equal(reused.status, 0, reused.stderr);
+  assert.equal(reused.output, 'PR_NUMBER=17\n');
+  assert.equal(readFileSync(log, 'utf8').match(/^pr create/gm).length, 2, 'no second PR when one is open');
 });

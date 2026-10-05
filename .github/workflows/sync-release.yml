@@ -107,9 +107,6 @@ jobs:
           esac
           echo "::warning::Release v$VERSION was not synced back to $STAGING_BRANCH automatically: ${REASON//\`/}. A sync PR is open for a lead."
 
-          gh label create "release-sync" --description "PR to sync release back to staging" --color "0052CC" --force
-          gh label create "automated" --description "Automated PR" --color "EDEDED" --force
-
           {
             echo "## 🔄 Release sync needs a lead"
             echo
@@ -143,11 +140,19 @@ jobs:
             --base "$STAGING_BRANCH" \
             --head "$MAIN_BRANCH" \
             --title "🔄 Sync Release v$VERSION back to $STAGING_BRANCH" \
-            --body-file pr_body.md \
-            --label "release-sync" \
-            --label "automated")
+            --body-file pr_body.md)
           echo "✅ Created PR: $PR_URL"
           echo "PR_NUMBER=${PR_URL##*/}" >> "$GITHUB_OUTPUT"
+
+          # Labels are a convenience. Without RELEASE_TOKEN, GITHUB_TOKEN may not be allowed to create
+          # them (callers grant no issues permission), and that must never stop the PR being opened.
+          if gh label create "release-sync" --description "PR to sync release back to staging" --color "0052CC" --force \
+            && gh label create "automated" --description "Automated PR" --color "EDEDED" --force \
+            && gh pr edit "$PR_URL" --add-label "release-sync" --add-label "automated"; then
+            echo "🏷️ Labelled the sync PR"
+          else
+            echo "::notice::The sync PR was opened without labels (this token cannot manage labels)."
+          fi
 
       - name: Add summary
         env:
