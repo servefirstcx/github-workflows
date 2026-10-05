@@ -81,7 +81,7 @@ Only on a **successful production** deploy, the action rebuilds the list from Gi
 - **Range:** from the previous successful production deployment recorded in GitHub to the deployed commit. A release that merged but never deployed is then still reported by the next deploy that ships it. If there is no earlier production deployment at all, only this release PR's changes are reported, with a warning. If deployments can't be read (the job lacks `deployments: read`), nothing is sent and the step fails so it is visible.
 - **Reverts:** a revert never reports a ticket, and every ticket on what it reverts is left out, even if another change also closes it. A revert of a revert also leaves the ticket out. When unsure, a ticket is left out rather than closed; move those by hand.
 - **Rollbacks and redeploys:** deploying an older version, or a commit that already reached production, reports nothing, and so does a deploy whose history doesn't include the previous one.
-- **Payload:** ticket keys in batches of 50:
+- **Payload:** ticket keys in batches of 50. `releaseType` is `"hotfix"` for tickets that came through a `hotfix/*` PR into main (its branch, its `Closes` lines, its fix commits and PRs merged into it) and `"release"` for everything else. It is decided per ticket, not per deploy, so the two are posted as separate requests: a hotfix that also ships an earlier release that never deployed reports that release's tickets as `"release"`, and a release that ships an undeployed hotfix reports the hotfix's tickets as `"hotfix"`.
 
 ```json
 {"issues": ["SF-4300", "SF-4401"], "data": {"repository": "servefirstcx/sf-api", "version": "4.25.0", "notesUrl": "https://github.com/servefirstcx/sf-api/releases/tag/v4.25.0", "releaseType": "release"}}
@@ -92,7 +92,7 @@ Nothing is validated or sent for staging, dev or failed deploys. GitHub holds on
 ### Jira rule (SF project)
 
 1. Trigger: *Incoming webhook*, "Issues provided in the webhook HTTP POST body". Copy the URL and secret.
-2. Condition (JQL): `project = SF AND issuetype != Epic AND status in ("Dev Complete"{{#if(equals(webhookData.releaseType, "hotfix"))}}, "Ready for Dev", "In Progress"{{/}})`. Normal releases move only tickets the team marked Dev Complete. **Hotfixes** (`releaseType: "hotfix"`, sent when the deployed PR comes from `hotfix/*`) also move Ready for Dev and In Progress tickets, because a hotfix ticket rarely reaches Dev Complete: the `hotfix/x.y.z` branch carries no ticket key, so the branch and merge rules never see it, and a hotfix only reports tickets someone explicitly linked with `Closes`. Other projects and epics are always ignored.
+2. Condition (JQL): `project = SF AND issuetype != Epic AND status in ("Dev Complete"{{#if(equals(webhookData.releaseType, "hotfix"))}}, "Ready for Dev", "In Progress"{{/}})`. Normal releases move only tickets the team marked Dev Complete. **Hotfix tickets** (`releaseType: "hotfix"`, see Payload above) also move Ready for Dev and In Progress tickets, because a hotfix ticket rarely reaches Dev Complete: the `hotfix/x.y.z` branch carries no ticket key, so the branch and merge rules never see it, and a hotfix only reports tickets someone explicitly linked with `Closes`. Other projects and epics are always ignored.
 3. Action: transition to *Done (In Production)*.
 4. Action: comment `Released to production in {{webhookData.repository}} v{{webhookData.version}}: {{webhookData.notesUrl}}` (Jira exposes the POST body's `data` fields directly on `webhookData`; `webhookData.data.*` renders empty).
 
