@@ -95,6 +95,28 @@ for (const scenario of ['conflict resolution', 'additional merge change', 'mecha
   });
 }
 
+for (const scenario of ['clean', 'conflict resolution', 'not yet in production']) {
+  test(`a sync merged straight to stage without a PR: ${scenario}`, async t => {
+    const r = repository(t);
+    r.git('checkout', '-b', 'stage'); r.git('checkout', 'main');
+    r.commit('Release 1.1 hotfix', 'app.txt', 'hotfix');
+    const production = r.git('rev-parse', 'HEAD');
+    r.git('checkout', 'stage');
+    const feature = r.commit('Stage feature', scenario === 'conflict resolution' ? 'app.txt' : 'feature.txt', 'feature');
+    // 'not yet in production': the merged-in side is not part of the release base.
+    const base = scenario === 'not yet in production' ? r.base : production;
+    if (scenario === 'conflict resolution') {
+      assert.throws(() => r.git('merge', '--no-ff', '--no-commit', 'main'));
+      writeFileSync(join(r.cwd, 'app.txt'), 'manually resolved'); r.git('add', '.'); r.git('commit', '-m', 'Sync release v1.1 from main back to stage');
+    } else r.git('merge', '--no-ff', '-m', 'Sync release v1.1 from main back to stage', 'main');
+    const sync = r.git('rev-parse', 'HEAD');
+    const inventory = await notes.collectInventory({ cwd: r.cwd, repository: 'acme/app', base, head: sync,
+      token: 'mock', fetchImpl: async url => response(new URL(url).pathname.includes(feature) ? [pr(100, feature)] : []) });
+    const ids = inventory.items.map(i => i.id).filter(id => id === 'pr:100' || id === `commit:${sync}`);
+    assert.deepEqual(ids, scenario === 'clean' ? ['pr:100'] : ['pr:100', `commit:${sync}`]);
+  });
+}
+
 test('explicit reverts remain visible separately and their original PR is not claimed shipped', async t => {
   const r = repository(t), feature = r.commit('Add export');
   r.git('revert', '--no-edit', feature); const revert = r.git('rev-parse', 'HEAD');

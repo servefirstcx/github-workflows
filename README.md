@@ -16,7 +16,9 @@ Automatically tags releases when PRs are merged to main.
 
 ### 3. Sync Release Workflow (`sync-release.yml`)
 
-Syncs releases back from main to stage.
+After a release or hotfix is tagged, merges `main` back into `stage` as a real merge commit and pushes it with `RELEASE_TOKEN`. There is no sync PR on the normal path, so nobody can squash it by mistake. A PR for a lead is opened only when the merge conflicts, the push is rejected, or the caller doesn't pass `RELEASE_TOKEN`. That PR must be merged as a merge commit, never squashed. Conflicts are resolved locally, because GitHub's conflict editor would commit to `main`, which is locked.
+
+As a backstop, the release workflow checks that `stage` contains `main` before it cuts a release branch. If a sync was squashed or never merged, it merges `main` into the release, with a warning, so the release PR stays clean and the next sync restores `stage`.
 
 ### 4. Hotfix Workflow (`hotfix.yml`)
 
@@ -138,12 +140,18 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   sync:
     uses: servefirstcx/github-workflows/.github/workflows/sync-release.yml@main
     # with:
     #   staging_branch: develop
     #   main_branch: master
+    secrets:
+      RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }} # pushes the merge to stage; without it a sync PR is opened instead
 ```
 
 ### Example: ECS Deployment Workflow

@@ -86,6 +86,17 @@ function mechanicalSync(cwd, sha) {
   } catch { return false; }
 }
 
+// A sync pushed straight to stage, with no PR: a clean merge whose second parent is history
+// production already has. Conflict resolutions and merge-only changes stay visible.
+function releasedHistoryMerge(cwd, sha, base) {
+  try {
+    const parents = git(cwd, 'show', '-s', '--format=%P', sha).split(' ').filter(Boolean);
+    if (parents.length !== 2) return false;
+    git(cwd, 'merge-base', '--is-ancestor', parents[1], base); // throws when it isn't
+    return mechanicalSync(cwd, sha);
+  } catch { return false; }
+}
+
 /** Complete inventory from local full git history plus fully paginated GitHub associations. */
 export async function collectInventory({ cwd = process.cwd(), repository, base, head, token,
   jiraBaseUrl = 'https://servefirst.atlassian.net', mainBranch = 'main', stagingBranch = 'stage', fetchImpl = fetch }) {
@@ -137,7 +148,7 @@ export async function collectInventory({ cwd = process.cwd(), repository, base, 
       items.push({ id: `pr:${number}`, kind: 'pr', number, sha: p.merge_commit_sha,
         url: `https://github.com/${repository}/pull/${number}`, title: p.title, body: p.body || '', branch: p.head?.ref || '' });
     }
-    if (!ids.size && !housekeeping.has(sha)) items.push({ id: `commit:${sha}`, kind: 'commit', sha,
+    if (!ids.size && !housekeeping.has(sha) && !releasedHistoryMerge(cwd, sha, base)) items.push({ id: `commit:${sha}`, kind: 'commit', sha,
       url: `https://github.com/${repository}/commit/${sha}`, title: message.split('\n')[0], body: message });
   }
   // Same rule the deployment notification re-checks against GitHub before telling Jira.
