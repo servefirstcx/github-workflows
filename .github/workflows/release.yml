@@ -274,7 +274,9 @@ jobs:
             const readPR = async () => {
               const {data: saved} = await github.rest.pulls.get({owner, repo, pull_number: pr.number});
               if (!sameIdentity(saved) || saved.state !== 'open') throw new Error('Release PR identity changed');
-              if (body !== undefined ? saved.body !== body :
+              // Apps edit a new PR's body within seconds: GitHub for Jira appends ticket link
+              // references and Cursor appends a summary. Our body must still be there, intact.
+              if (body !== undefined ? !saved.body?.includes(body) :
                   !saved.body?.includes('<!-- sf-release-notes:start -->') || !saved.body?.includes('<!-- sf-release-notes:end -->')) {
                 throw new Error('PR body verification failed');
               }
