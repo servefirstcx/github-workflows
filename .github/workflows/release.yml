@@ -79,6 +79,29 @@ jobs:
           git config user.name "${{ inputs.bot_name }}"
           git config user.email "${{ inputs.bot_email }}"
 
+      - name: Include main history missing from stage
+        env:
+          MAIN_BRANCH: ${{ inputs.main_branch }}
+          STAGING_BRANCH: ${{ inputs.staging_branch }}
+        run: |
+          # Backstop for a release sync that was squashed or never merged: stage then lacks main's
+          # history, so the release PR shows old changes and conflicts, and a version bump made on
+          # main (a hotfix) is missed. Merge main into this local checkout before the version is
+          # read; the release branch is cut from it, and the sync after the release restores stage.
+          git fetch --no-tags origin "+refs/heads/$MAIN_BRANCH:refs/remotes/origin/$MAIN_BRANCH"
+          if git merge-base --is-ancestor "origin/$MAIN_BRANCH" HEAD; then
+            echo "✅ $STAGING_BRANCH contains $MAIN_BRANCH"
+            exit 0
+          fi
+          MISSING=$(git rev-list --count "HEAD..origin/$MAIN_BRANCH")
+          if ! git merge --no-ff --no-edit -m "Merge $MAIN_BRANCH into the release: restore $MISSING commit(s) missing from $STAGING_BRANCH" "origin/$MAIN_BRANCH"; then
+            git merge --abort
+            echo "::error::$STAGING_BRANCH is missing $MISSING commit(s) from $MAIN_BRANCH and they conflict. A lead must merge $MAIN_BRANCH into $STAGING_BRANCH as a merge commit, then run this workflow again."
+            exit 1
+          fi
+          echo "::warning::$STAGING_BRANCH was missing $MISSING commit(s) from $MAIN_BRANCH (a release sync was squashed or never merged). They are merged into this release, and the sync after it restores $STAGING_BRANCH."
+          echo "⚠️ \`$STAGING_BRANCH\` was missing $MISSING commit(s) from \`$MAIN_BRANCH\`; they were merged into this release." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Get current version
         id: current_version
         run: |
@@ -251,7 +274,9 @@ jobs:
             const readPR = async () => {
               const {data: saved} = await github.rest.pulls.get({owner, repo, pull_number: pr.number});
               if (!sameIdentity(saved) || saved.state !== 'open') throw new Error('Release PR identity changed');
-              if (body !== undefined ? saved.body !== body :
+              // Apps edit a new PR's body within seconds: GitHub for Jira appends ticket link
+              // references and Cursor appends a summary. Our body must still be there, intact.
+              if (body !== undefined ? !saved.body?.includes(body) :
                   !saved.body?.includes('<!-- sf-release-notes:start -->') || !saved.body?.includes('<!-- sf-release-notes:end -->')) {
                 throw new Error('PR body verification failed');
               }

@@ -45,6 +45,22 @@ test('release workflow transports literal Markdown and verifies ready labelled P
   assert.equal(state.pr.draft,false);assert.equal(state.outputs.pr_number,7);assert.ok(state.pr.labels.some(l=>l.name==='release'));
 });
 
+test('apps appending to the new PR body (Jira links, Cursor summary) do not fail verification', async () => {
+  const {state,github,invoke}=fixture();const get=github.rest.pulls.get;
+  // GitHub for Jira and Cursor edit the body seconds after creation, between our reads.
+  github.rest.pulls.get=async args=>{if(state.pr&&!state.pr.body.includes('[SF-1]:'))state.pr.body+='\n\n[SF-1]: https://servefirst.atlassian.net/browse/SF-1?atlOrigin=x';return get(args);};
+  await invoke();
+  assert.equal(state.pr.draft,false);assert.equal(state.outputs.pr_number,7);
+  assert.ok(state.pr.body.includes(notes) && state.pr.body.endsWith('atlOrigin=x'));
+});
+
+test('a changed release notes body still fails verification', async () => {
+  const {state,github,invoke}=fixture();const get=github.rest.pulls.get;
+  github.rest.pulls.get=async args=>{state.pr.body=state.pr.body.replace('stay literal','were rewritten');return get(args);};
+  await assert.rejects(invoke,/PR body verification failed/);
+  assert.deepEqual(state.outputs,{});
+});
+
 function branchFixture(t) {
   const root=mkdtempSync(join(tmpdir(),'release-retry-'));
   t.after(()=>rmSync(root,{recursive:true,force:true}));

@@ -50,7 +50,7 @@ test('first publish creates repository page, version page, labels, released Jira
   for (const fact of ['<a href="https://github.com/servefirstcx/sf-api/commit/' + DEPLOYED + '">ccccccc</a>', '2026-10-03T10:15:00Z',
     '<a href="https://github.com/servefirstcx/sf-api/pull/7">#7</a> Release 4.26.0', '<a href="https://github.com/servefirstcx/sf-api/releases/tag/v4.26.0">',
     '<a href="https://github.com/servefirstcx/sf-api/commit/' + PREV + '">ddddddd</a>', `compare/${PREV}...${DEPLOYED}`,
-    '<td><a href="https://servefirst.atlassian.net/browse/SF-1">SF-1</a></td><td>Grid images lost</td><td>Bug</td><td>Dev Complete</td>',
+    '<td><a href="https://servefirst.atlassian.net/browse/SF-1">SF-1</a></td><td>Grid images lost</td><td>Bug</td>',
     '<td><a href="https://servefirst.atlassian.net/browse/SF-404">SF-404</a></td><td>Not found in Jira</td>',
     '<td>CSAT SMS step 1</td><td>unknown</td><td>2026-10-01</td>', '<h2>Left out (reverted)</h2>', '<td>revert</td>', '<td>reverted</td>',
     'Generated automatically from the production deploy. Facts only.']) assert.ok(version.body.includes(fact), fact);
@@ -228,4 +228,21 @@ test('preview renders the page and plan without any request', () => {
   assert.match(preview.lines.join('\n'), /Jira version "sf-api 4\.26\.0" in SF dated 2026-10-03 and add it to 3 SF ticket\(s\) that exist: SF-1, SF-2, SF-404/);
   assert.match(preview.body, /Not fetched \(dry run\)/);
   assert.match(preview.body, /None recorded \(first production deploy/);
+});
+
+test('changes without a ticket are called out: unlinked PRs and direct commits, with counts in Details', async () => {
+  const facts = released({pullRequests: [...released().pullRequests, {number: 15, title: 'Eva <report> chat', author: 'dev15', mergedAt: '2026-10-01T10:00:00Z', tickets: []}],
+    directCommits: [{sha: 'e'.repeat(40), title: 'fix: cap cells & rows', author: 'dev16', committedAt: '2026-10-02T08:00:00Z', tickets: []},
+      {sha: 'f'.repeat(40), title: 'fix: hotfix with ticket', author: null, committedAt: '2026-10-02T09:00:00Z', tickets: ['SF-1']}]});
+  const html = a.renderReleasePage({plan: a.releasePlan({repository: 'servefirstcx/sf-api', version: '4.26.0'}), deployedSha: DEPLOYED, deployedAt: '2026-10-03T10:15:00.000Z',
+    notesUrl: 'https://github.com/servefirstcx/sf-api/releases/tag/v4.26.0', released: facts, issues: new Map(Object.entries(issues()))});
+  assert.match(html, /<th>Pull requests<\/th><td>3 \(2 linked to tickets, 1 without\)<\/td>/);
+  assert.match(html, /<th>Commits without a pull request<\/th><td>2<\/td>/);
+  const unlinked = html.slice(html.indexOf('<h2>Shipped without a ticket (2)</h2>'), html.indexOf('<h2>Tickets shipped'));
+  assert.ok(unlinked.includes('/pull/15">#15</a>') && unlinked.includes('Eva &lt;report&gt; chat') && unlinked.includes('fix: cap cells &amp; rows'));
+  assert.ok(!unlinked.includes('hotfix with ticket') && !unlinked.includes('/pull/10"'), 'Linked changes are not called out');
+  assert.match(html, /<h2>Commits without a pull request \(2\)<\/h2>/);
+  const none = a.renderReleasePage({plan: a.releasePlan({repository: 'servefirstcx/sf-api', version: '4.26.0'}), deployedSha: DEPLOYED, deployedAt: '2026-10-03T10:15:00.000Z',
+    notesUrl: null, released: released(), issues: null});
+  assert.ok(!none.includes('Shipped without a ticket') && !none.includes('Commits without a pull request'), 'Sections only appear when needed');
 });

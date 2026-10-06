@@ -464,7 +464,44 @@ test('released tickets are rebuilt from GitHub since the last production deploy,
   // Not: SF-9/SF-8 (mentions), SF-3 (reverted), SF-90/SF-98 (sync PR), SF-97 (no "Closes"), SF-99 (inside the notes block).
   assert.deepEqual(result.tickets, ['SF-1', 'SF-10', 'SF-11', 'SF-2', 'SF-5', 'SF-6', 'SF-7']);
   assert.deepEqual(result.warnings, []);
+  // Only the hotfix fix commit reached production without a PR: version bumps, the release merge,
+  // sync/merge commits and PR commits are not "direct".
+  assert.deepEqual(result.directCommits.map(c => [c.sha, c.title, c.tickets]), [[sha(2000), 'hotfix: cap export cells', ['SF-5']]]);
   assert.ok(fixture.calls.every(c => c.init.redirect === 'error' && c.init.signal));
+});
+
+test('released tickets: only work that came through a hotfix PR is a hotfix ticket', async () => {
+  const main = {ref: 'main', repo: {full_name: 'org/repo'}};
+  const hotfixPr = {...pr(), merged_at: '2026-01-03T00:00:00Z', head: {sha: HEAD, ref: 'hotfix/1.2.1', repo: {full_name: 'org/repo'}}, base: main, body: 'Closes SF-80'};
+  // An earlier release merged to main but never deployed, so it rides in the hotfix's range.
+  const earlier = repoPr(40, 'release/1.2.0', {base: main, body: 'Closes SF-41'});
+  const feature = repoPr(42, 'SF-42-feature');
+  const intoHotfix = repoPr(43, 'SF-83-fix', {base: {ref: 'hotfix/1.2.1', repo: {full_name: 'org/repo'}}});
+  const range = [
+    [commit(sha(42), 'Merge pull request #42 from org/SF-42-feature'), [feature, earlier]],
+    [commit(sha(40), 'Merge pull request #40 from org/release/1.2.0'), [earlier]],
+    [commit(sha(7001), 'fix export\n\nCloses SF-81'), [hotfixPr]],
+    [commit(sha(43), 'Merge pull request #43 from org/SF-83-fix'), [intoHotfix, hotfixPr]],
+    [commit(MERGE, 'Merge pull request #7 from org/hotfix/1.2.1'), [hotfixPr]],
+  ];
+  const deployed = await d.releasedTickets({...deployOptions, fetch: releaseFixture({range, extra: {'GET /pulls/7': hotfixPr}}).fetch});
+  assert.deepEqual(deployed.tickets, ['SF-41', 'SF-42', 'SF-80', 'SF-81', 'SF-83']);
+  // The hotfix's description, fix commit and the PR merged into it; not the earlier release's feature or "Closes" line.
+  assert.deepEqual(deployed.hotfixTickets, ['SF-80', 'SF-81', 'SF-83']);
+  // The other way round: a release deploy that also ships a hotfix that never deployed reports its tickets as hotfix.
+  const releasePr = releasePrFor();
+  const undeployed = repoPr(44, 'hotfix/1.1.1', {base: main, body: 'Closes SF-84'});
+  const later = [
+    [commit(sha(7002), 'cap cells\n\nCloses SF-85'), [undeployed, releasePr]],
+    [commit(sha(44), 'Merge pull request #44 from org/hotfix/1.1.1'), [undeployed, releasePr]],
+    [commit(sha(42), 'Merge pull request #42 from org/SF-42-feature'), [feature, releasePr]],
+    [commit(MERGE, 'Merge pull request #7 from org/release/1.2'), [releasePr]],
+  ];
+  const shipped = await d.releasedTickets({...deployOptions, fetch: releaseFixture({range: later, extra: {'GET /pulls/7': releasePr}}).fetch});
+  assert.deepEqual(shipped.tickets, ['SF-42', 'SF-6', 'SF-84', 'SF-85']);
+  assert.deepEqual(shipped.hotfixTickets, ['SF-84', 'SF-85']);
+  // A plain release has none.
+  assert.deepEqual((await d.releasedTickets({...deployOptions, fetch: releaseFixture().fetch})).hotfixTickets, []);
 });
 
 test('released tickets: range comes from the previous production deploy, and fails closed without it', async () => {
@@ -574,6 +611,8 @@ test('released tickets: reverting a commit inside a hotfix drops the hotfix bran
   ];
   const result = await d.releasedTickets({...deployOptions, fetch: releaseFixture({range, extra: {'GET /pulls/7': release}}).fetch});
   assert.deepEqual(result.tickets, ['SF-6']);
+  // The reverted fix and its revert are not listed as shipped direct commits.
+  assert.deepEqual(result.directCommits, []);
 });
 
 test('released tickets: a deployed hotfix whose fix was reverted reports nothing', async () => {
@@ -585,8 +624,11 @@ test('released tickets: a deployed hotfix whose fix was reverted reports nothing
   ];
   const result = await d.releasedTickets({...deployOptions, fetch: releaseFixture({range, extra: {'GET /pulls/7': hotfix}}).fetch});
   assert.deepEqual(result.tickets, []);
+  assert.deepEqual(result.directCommits, [], 'Undone hotfix work is not listed as shipped');
   const kept = await d.releasedTickets({...deployOptions, fetch: releaseFixture({range: [range[0], range[2]], extra: {'GET /pulls/7': hotfix}}).fetch});
   assert.deepEqual(kept.tickets, ['SF-78']);
+  // A fix on hotfix/SF-78-… is covered by the branch ticket, so it isn't flagged as having no ticket.
+  assert.deepEqual(kept.directCommits.map(c => [c.sha, c.title, c.tickets]), [[sha(8101), 'neutral fix', ['SF-78']]]);
 });
 
 test('released tickets: redeploying an already deployed commit reports nothing; a failed earlier attempt does not count', async () => {
@@ -715,16 +757,26 @@ test('Jira webhook requires current endpoint and secret, batches, and never leak
     await assert.rejects(d.sendJiraRelease({webhook: bad, secret: 'shh', tickets: ['SF-1'], fetch: () => assert.fail('Bad webhook fetched')}), /Invalid Jira automation webhook URL/);
   }
   for (const secret of [undefined, '', 'a\nb']) await assert.rejects(d.sendJiraRelease({webhook: JIRA_HOOK, secret, tickets: ['SF-1'], fetch: () => assert.fail('No secret')}), /secret is required/);
-  assert.deepEqual(await d.sendJiraRelease({webhook: JIRA_HOOK, secret: 'shh', tickets: [], fetch: () => assert.fail('No tickets')}), {sent: false, skipped: true, tickets: 0});
+  assert.deepEqual(await d.sendJiraRelease({webhook: JIRA_HOOK, secret: 'shh', tickets: [], fetch: () => assert.fail('No tickets')}), {sent: false, skipped: true, tickets: 0, hotfixTickets: 0});
   await assert.rejects(d.sendJiraRelease({webhook: JIRA_HOOK, secret: 'shh', tickets: ['sf-1'], fetch: () => assert.fail('Bad key fetched')}), /Invalid Jira ticket keys/);
   const posts = [];
   const tickets = Array.from({length: 120}, (_, i) => `SF-${i + 1}`);
   const result = await d.sendJiraRelease({webhook: JIRA_HOOK, secret: 'shh', tickets, repository: 'org/repo', version: '1.2', notesUrl: 'https://github.com/org/repo/pull/7',
     fetch: async (url, init) => { posts.push({url, init, body: JSON.parse(init.body)}); return new Response('{}'); }});
-  assert.deepEqual(result, {sent: true, skipped: false, tickets: 120});
+  assert.deepEqual(result, {sent: true, skipped: false, tickets: 120, hotfixTickets: 0});
   assert.deepEqual(posts.map(p => p.body.issues.length), [50, 50, 20]);
   assert.deepEqual(posts.flatMap(p => p.body.issues), tickets);
-  assert.deepEqual(posts[0].body.data, {repository: 'org/repo', version: '1.2', notesUrl: 'https://github.com/org/repo/pull/7'});
+  assert.deepEqual(posts[0].body.data, {repository: 'org/repo', version: '1.2', notesUrl: 'https://github.com/org/repo/pull/7', releaseType: 'release'});
+  // Hotfix tickets go in their own requests, so only they get the rule's wider status gate.
+  const mixed = [];
+  const mixedResult = await d.sendJiraRelease({webhook: JIRA_HOOK, secret: 'shh', tickets: ['SF-1', 'SF-2', 'SF-3'], hotfixTickets: ['SF-2'], repository: 'org/repo', version: '1.2.1', notesUrl: null,
+    fetch: async (url, init) => { mixed.push(JSON.parse(init.body)); return new Response('{}'); }});
+  assert.deepEqual(mixed.map(b => [b.data.releaseType, b.issues]), [['release', ['SF-1', 'SF-3']], ['hotfix', ['SF-2']]]);
+  assert.deepEqual(mixedResult, {sent: true, skipped: false, tickets: 3, hotfixTickets: 1});
+  const onlyHotfix = [];
+  await d.sendJiraRelease({webhook: JIRA_HOOK, secret: 'shh', tickets: ['SF-1'], hotfixTickets: ['SF-1'], fetch: async (url, init) => { onlyHotfix.push(JSON.parse(init.body)); return new Response('{}'); }});
+  assert.deepEqual(onlyHotfix.map(b => [b.data.releaseType, b.issues]), [['hotfix', ['SF-1']]], 'No empty release request');
+  await assert.rejects(d.sendJiraRelease({webhook: JIRA_HOOK, secret: 'shh', tickets: ['SF-1'], hotfixTickets: ['SF-2'], fetch: () => assert.fail('Unreleased hotfix ticket fetched')}), /Hotfix tickets must be released tickets/);
   assert.equal(posts[0].init.headers['X-Automation-Webhook-Token'], 'shh');
   assert.equal(posts[0].init.redirect, 'error');
   assert.ok(posts[0].init.signal);
@@ -752,6 +804,7 @@ test('notification CLI: Jira only for successful production, independent of Slac
   const result = await main(env, {fetch: jiraOnly.fetch, ...quiet});
   assert.equal(result.jira.sent, true);
   assert.deepEqual(jiraOnly.jira.map(b => b.issues), [['SF-1', 'SF-10', 'SF-11', 'SF-2', 'SF-5', 'SF-6', 'SF-7']]);
+  assert.deepEqual(jiraOnly.jira.map(b => b.data.releaseType), ['release'], 'A release/* deploy with no hotfix PR in range is all release tickets');
   assert.equal(jiraOnly.jira[0].data.notesUrl, 'https://github.com/org/repo/pull/7');
   const slackDown = withPosts(500);
   await assert.rejects(main({...env, SLACK_WEBHOOK_URL: 'https://hooks.slack.com/services/T1/B2/S3'}, {fetch: slackDown.fetch, ...quiet}), /Slack delivery failed/);
@@ -867,6 +920,6 @@ test('notification CLI dry-run shows the Jira release and Confluence page it wou
     assert.match(body, /<h2>Tickets shipped \(7\)<\/h2>/);
     assert.match(body, /Not fetched \(dry run\)/);
   } finally { await rm(directory, {recursive: true, force: true}); }
-  assert.ok(logs.some(line => line.startsWith('Atlassian dry-run: would publish Confluence page "repo 1.2" (Eng › Release notes › repo release notes; labels release-notes, repo-repo) with 7 ticket(s), 3 PR(s) and 2 reverted PR(s) left out.')));
+  assert.ok(logs.some(line => line.startsWith('Atlassian dry-run: would publish Confluence page "repo 1.2" (Eng › Release notes › repo release notes; labels release-notes, repo-repo) with 7 ticket(s), 3 PR(s) (0 without a ticket), 1 direct commit(s) and 2 reverted PR(s) left out.')));
   assert.ok(logs.some(line => line === 'Atlassian dry-run: would release Jira version "repo 1.2" in SF dated 2026-10-03 and add it to 7 SF ticket(s) that exist: SF-1, SF-10, SF-11, SF-2, SF-5, SF-6, SF-7.'));
 });
