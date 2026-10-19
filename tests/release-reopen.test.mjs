@@ -91,13 +91,14 @@ function restoreFixture(t) {
   git(root, 'clone', '-q', '-b', 'stage', remote, runner);
   git(runner, 'config', 'user.email', 'test@example.invalid'); git(runner, 'config', 'user.name', 'Test');
   const output = join(root, 'output');
-  const run = name => {
+  const run = (name, {fresh = true} = {}) => {
     const shell = stepOf(name).match(/        run: \|\n([\s\S]*)/)[1].split('\n').map(l => l.slice(10)).join('\n');
     writeFileSync(output, '');
-    git(runner, 'checkout', '-q', '--detach', 'origin/stage');
+    if (fresh) { git(runner, 'fetch', '-q', 'origin'); git(runner, 'checkout', '-q', '--detach', 'origin/stage'); }
     return spawnSync('bash', ['-e', '-c', shell], {cwd: runner, encoding: 'utf8', env: {...process.env,
-      NEW_VERSION: '1.2.3', PR_NUMBER: '4', OLD_HEAD: oldHead, STAGING_BRANCH: 'stage',
-      PACKAGE_FILE: 'package.json', PACKAGE_LOCK: 'package-lock.json', GITHUB_OUTPUT: output}});
+      NEW_VERSION: '1.2.3', PR_NUMBER: '4', OLD_HEAD: oldHead, STAGING_BRANCH: 'stage', MAIN_BRANCH: 'main',
+      PACKAGE_FILE: 'package.json', PACKAGE_LOCK: 'package-lock.json', GITHUB_OUTPUT: output,
+      GITHUB_STEP_SUMMARY: join(root, 'summary')}});
   };
   const remoteHead = () => { try { return git(remote, 'rev-parse', 'refs/heads/release/1.2.3'); } catch { return ''; } };
   const show = (ref, file) => git(remote, 'show', `${ref}:${file}`);
@@ -161,6 +162,42 @@ for (const [name, files] of [
     refused(f, f.run('Restore the closed release'), /has commits that are not in #4/, amended);
   });
 }
+
+// Bugbot on 86e01a2: when stage lacked main history, the earlier failed run's bump sits on that
+// run's own local "Merge main into the release" commit, so it is two commits away from stage.
+function leftoverOnMainMerge(f, tamper) {
+  f.git(f.seed, 'checkout', '-q', '--detach', 'stage~1');
+  writeFileSync(join(f.seed, 'h.txt'), 'hotfix on main\n'); f.git(f.seed, 'add', '.'); f.git(f.seed, 'commit', '-q', '-m', 'hotfix');
+  f.git(f.seed, 'push', '-q', 'origin', 'HEAD:refs/heads/main');
+  ok(f.run('Include main history missing from stage')); // the earlier run merges main locally
+  if (tamper) { writeFileSync(join(f.runner, 'sneak.txt'), 'extra\n'); f.git(f.runner, 'add', '.'); f.git(f.runner, 'commit', '-q', '--amend', '--no-edit'); }
+  writeFileSync(join(f.runner, 'package.json'), pkg('1.2.3')); writeFileSync(join(f.runner, 'package-lock.json'), lock('1.2.3'));
+  f.git(f.runner, 'add', '.'); f.git(f.runner, 'commit', '-q', '-m', 'chore: bump version to 1.2.3');
+  f.git(f.runner, 'push', '-q', 'origin', 'HEAD:refs/heads/release/1.2.3');
+  const leftover = f.remoteHead();
+  f.git(f.seed, 'checkout', '-q', 'stage');
+  writeFileSync(join(f.seed, 'd.txt'), 'more stage work\n'); f.git(f.seed, 'add', '.'); f.git(f.seed, 'commit', '-q', '-m', 'more work');
+  f.git(f.seed, 'push', '-q', 'origin', 'stage');
+  ok(f.run('Include main history missing from stage')); // this run merges main again, a different commit
+  return leftover;
+}
+
+test('a leftover bump on an earlier run\'s own main merge is still replaced', t => {
+  const f = restoreFixture(t);
+  const leftover = leftoverOnMainMerge(f, false);
+  ok(f.run('Restore the closed release', {fresh: false}));
+  const head = f.remoteHead();
+  assert.notEqual(head, leftover);
+  assert.equal(f.git(f.remote, 'rev-parse', `${head}^1`), f.oldHead);
+  assert.equal(f.show(head, 'h.txt'), 'hotfix on main');
+  assert.equal(f.show(head, 'd.txt'), 'more stage work');
+});
+
+test('a leftover bump on an edited main merge is not thrown away', t => {
+  const f = restoreFixture(t);
+  const leftover = leftoverOnMainMerge(f, true);
+  refused(f, f.run('Restore the closed release', {fresh: false}), /has commits that are not in #4/, leftover);
+});
 
 test('commits pushed to the branch after closing are kept, without a force push', t => {
   const f = restoreFixture(t);

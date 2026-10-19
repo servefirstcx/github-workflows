@@ -174,6 +174,7 @@ jobs:
           PR_NUMBER: ${{ steps.closed_release.outputs.pr_number }}
           OLD_HEAD: ${{ steps.closed_release.outputs.old_head }}
           STAGING_BRANCH: ${{ inputs.staging_branch }}
+          MAIN_BRANCH: ${{ inputs.main_branch }}
           PACKAGE_FILE: ${{ inputs.package_file }}
           PACKAGE_LOCK: ${{ inputs.package_lock }}
         run: |
@@ -198,9 +199,22 @@ jobs:
           # True when TIP is exactly the version bump an earlier failed run of this workflow made on
           # top of stage: one single-parent commit whose files equal its parent's with the same sed
           # edits the "Update version in package.json" step makes (lines 3 and 9), and nothing else.
+          # Below it there may be that run's own "Merge main into the release" commit (made when stage
+          # was missing main history); it is accepted only untouched: both parents already in SOURCE
+          # and its tree equal to a clean merge of them.
           only_a_version_bump() {
-            [ "$(git rev-list --count "$SOURCE..$TIP")" = 1 ] || return 1
             [ "$(git rev-list --parents -n 1 "$TIP" | wc -w)" = 2 ] || return 1
+            local c parents
+            for c in $(git rev-list "$SOURCE..$TIP^"); do
+              case "$(git log -1 --format=%s "$c")" in
+                "Merge $MAIN_BRANCH into the release: restore "*) ;;
+                *) return 1 ;;
+              esac
+              parents=$(git rev-list --parents -n 1 "$c" | cut -d' ' -f2-)
+              [ "$(echo "$parents" | wc -w)" = 2 ] || return 1
+              for p in $parents; do git merge-base --is-ancestor "$p" "$SOURCE" || return 1; done
+              [ "$(git merge-tree --write-tree $parents 2>/dev/null)" = "$(git rev-parse "$c^{tree}")" ] || return 1
+            done
             [ "$(git log -1 --format=%s "$TIP")" = "chore: bump version to $NEW_VERSION" ] || return 1
             [ -z "$(git diff --name-only "$TIP^" "$TIP" | grep -vxF -e "$PACKAGE_FILE" -e "$PACKAGE_LOCK")" ] || return 1
             [ -z "$(git diff --summary "$TIP^" "$TIP")" ] || return 1
