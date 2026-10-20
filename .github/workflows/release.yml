@@ -132,6 +132,128 @@ jobs:
           echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
           echo "🚀 New version will be: $NEW_VERSION"
 
+      - name: Find a closed release that never shipped
+        id: closed_release
+        uses: actions/github-script@v7
+        env:
+          VERSION: ${{ steps.new_version.outputs.version }}
+          MAIN_BRANCH: ${{ inputs.main_branch }}
+        with:
+          script: |
+            // Closing a release PR to add more work and running this workflow again should start
+            // the release over. Only a single closed, unmerged, untagged PR qualifies; anything else
+            // (open, merged, tagged, several) is left to the Create Pull Request step's checks.
+            const { owner, repo } = context.repo;
+            const version = process.env.VERSION;
+            const head = `release/${version}`, base = process.env.MAIN_BRANCH;
+            const self = `${owner}/${repo}`.toLowerCase();
+            const matches = (await github.paginate(github.rest.pulls.list, {
+              owner, repo, head: `${owner}:${head}`, base, state: 'all', per_page: 100,
+            })).filter(pr => pr.head?.ref === head && pr.base?.ref === base &&
+              pr.head?.repo?.full_name?.toLowerCase() === self && pr.base?.repo?.full_name?.toLowerCase() === self);
+            if (matches.length !== 1 || matches[0].state !== 'closed' || matches[0].merged_at) return;
+            const pr = matches[0];
+            for (const tag of [`v${version}`, version]) {
+              try {
+                await github.rest.git.getRef({owner, repo, ref: `tags/${tag}`});
+                core.info(`Tag ${tag} exists, so v${version} was released; not reopening #${pr.number}`);
+                return;
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+            }
+            if (!/^[0-9a-f]{40}$/.test(pr.head?.sha || '')) throw new Error('Closed release PR has no head commit');
+            core.setOutput('pr_number', String(pr.number));
+            core.setOutput('old_head', pr.head.sha);
+
+      - name: Restore the closed release
+        id: restore
+        if: steps.closed_release.outputs.pr_number != ''
+        env:
+          NEW_VERSION: ${{ steps.new_version.outputs.version }}
+          PR_NUMBER: ${{ steps.closed_release.outputs.pr_number }}
+          OLD_HEAD: ${{ steps.closed_release.outputs.old_head }}
+          STAGING_BRANCH: ${{ inputs.staging_branch }}
+          MAIN_BRANCH: ${{ inputs.main_branch }}
+          PACKAGE_FILE: ${{ inputs.package_file }}
+          PACKAGE_LOCK: ${{ inputs.package_lock }}
+        run: |
+          # GitHub reopens a closed PR only while its branch is at, or moved forward from, the PR's
+          # last commit. Put the branch back on that commit (keeping anything pushed on top of it),
+          # then merge stage in. The PR stays closed here: the Create Pull Request step refreshes its
+          # notes and reopens it last, so a failure anywhere before that leaves a closed PR and a
+          # rerun simply does this again. This step never moves the branch away from human commits.
+          RELEASE_BRANCH="release/$NEW_VERSION"
+          SOURCE=$(git rev-parse HEAD) # stage, plus any main history the step above merged in
+          git fetch --no-tags origin "+refs/pull/$PR_NUMBER/head:refs/remotes/origin/closed-release"
+          if [ "$(git rev-parse refs/remotes/origin/closed-release)" != "$OLD_HEAD" ]; then
+            echo "::error::#$PR_NUMBER's last commit could not be fetched. Reopen it by hand, then run this workflow again."
+            exit 1
+          fi
+          set +e
+          TIP=$(git ls-remote --exit-code --heads origin "refs/heads/$RELEASE_BRANCH")
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then TIP=${TIP%%[[:space:]]*}; elif [ "$status" -eq 2 ]; then TIP=""; else exit "$status"; fi
+
+          # True when TIP is exactly the version bump an earlier failed run of this workflow made on
+          # top of stage: one single-parent commit whose files equal its parent's with the same sed
+          # edits the "Update version in package.json" step makes (lines 3 and 9), and nothing else.
+          # Below it there may be that run's own "Merge main into the release" commit (made when stage
+          # was missing main history); it is accepted only untouched: both parents already in SOURCE
+          # and its tree equal to a clean merge of them.
+          only_a_version_bump() {
+            [ "$(git rev-list --parents -n 1 "$TIP" | wc -w)" = 2 ] || return 1
+            local c parents
+            for c in $(git rev-list "$SOURCE..$TIP^"); do
+              case "$(git log -1 --format=%s "$c")" in
+                "Merge $MAIN_BRANCH into the release: restore "*) ;;
+                *) return 1 ;;
+              esac
+              parents=$(git rev-list --parents -n 1 "$c" | cut -d' ' -f2-)
+              [ "$(echo "$parents" | wc -w)" = 2 ] || return 1
+              for p in $parents; do git merge-base --is-ancestor "$p" "$SOURCE" || return 1; done
+              [ "$(git merge-tree --write-tree $parents 2>/dev/null)" = "$(git rev-parse "$c^{tree}")" ] || return 1
+            done
+            [ "$(git log -1 --format=%s "$TIP")" = "chore: bump version to $NEW_VERSION" ] || return 1
+            [ -z "$(git diff --name-only "$TIP^" "$TIP" | grep -vxF -e "$PACKAGE_FILE" -e "$PACKAGE_LOCK")" ] || return 1
+            [ -z "$(git diff --summary "$TIP^" "$TIP")" ] || return 1
+            local bump='s/"version": "[^"]*"/"version": "'"$NEW_VERSION"'"/'
+            git show "$TIP^:$PACKAGE_FILE" | sed "3$bump" | cmp -s - <(git show "$TIP:$PACKAGE_FILE") || return 1
+            if git cat-file -e "$TIP^:$PACKAGE_LOCK" 2>/dev/null || git cat-file -e "$TIP:$PACKAGE_LOCK" 2>/dev/null; then
+              git show "$TIP^:$PACKAGE_LOCK" | sed -e "3$bump" -e "9$bump" | cmp -s - <(git show "$TIP:$PACKAGE_LOCK") || return 1
+            fi
+          }
+
+          KEEP="$OLD_HEAD" # the commit the release continues from
+          if [ -z "$TIP" ]; then
+            git push origin "$OLD_HEAD:refs/heads/$RELEASE_BRANCH"
+          elif [ "$TIP" != "$OLD_HEAD" ]; then
+            git fetch --no-tags origin "refs/heads/$RELEASE_BRANCH"
+            if git merge-base --is-ancestor "$OLD_HEAD" "$TIP"; then
+              KEEP="$TIP" # commits pushed after the PR closed stay; GitHub still reopens it
+            elif only_a_version_bump; then
+              echo "Replacing the version bump an earlier run of this workflow left on $RELEASE_BRANCH"
+              git push --force-with-lease="refs/heads/$RELEASE_BRANCH:$TIP" origin "$OLD_HEAD:refs/heads/$RELEASE_BRANCH"
+            else
+              echo "::error::$RELEASE_BRANCH has commits that are not in #$PR_NUMBER or $STAGING_BRANCH. Nothing was changed: decide what to keep, then reopen #$PR_NUMBER by hand or delete the branch."
+              exit 1
+            fi
+          fi
+
+          git checkout -q --detach "$KEEP"
+          if git merge-base --is-ancestor "$SOURCE" HEAD; then
+            echo "✅ $RELEASE_BRANCH already has everything on $STAGING_BRANCH"
+          elif git merge --no-ff --no-edit -m "Merge $STAGING_BRANCH into $RELEASE_BRANCH" "$SOURCE"; then
+            git push origin "HEAD:refs/heads/$RELEASE_BRANCH"
+            echo "✅ Merged $STAGING_BRANCH into $RELEASE_BRANCH"
+          else
+            git merge --abort
+            echo "::error::$STAGING_BRANCH conflicts with $RELEASE_BRANCH. #$PR_NUMBER is still closed. Merge $STAGING_BRANCH into $RELEASE_BRANCH by hand as a merge commit, then run this workflow again."
+            exit 1
+          fi
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
       - name: Create release branch
         id: release_branch
         env:
@@ -224,6 +346,7 @@ jobs:
           NOTES_FILE: ${{ steps.notes.outputs.notes-file }}
           VERSION: ${{ steps.new_version.outputs.version }}
           MAIN_BRANCH: ${{ inputs.main_branch }}
+          REOPEN_PR: ${{ steps.restore.outputs.pr_number }}
         with:
           script: |
             const fs = require('fs');
@@ -243,7 +366,32 @@ jobs:
               }
               return matches[0];
             };
-            let pr = await findPR();
+            // A closed release that never shipped was restored by the step above. Refresh its notes
+            // while it is still closed (nobody is reviewing it), then reopen it as the last change, so
+            // any failure before this point leaves it closed and a rerun starts the restart again.
+            const reopen = async number => {
+              const start = '<!-- sf-release-notes:start -->', end = '<!-- sf-release-notes:end -->';
+              const notes = fs.readFileSync(process.env.NOTES_FILE, 'utf8').trimEnd();
+              if (!notes.startsWith(start) || !notes.endsWith(end)) throw new Error('Invalid generated notes');
+              const {data: closed} = await github.rest.pulls.get({owner, repo, pull_number: number});
+              if (!sameIdentity(closed) || closed.state !== 'closed' || closed.merged_at) throw new Error('Release PR to reopen changed');
+              const old = closed.body || '';
+              const from = old.indexOf(start), to = from < 0 ? -1 : old.indexOf(end, from);
+              const updated = to < 0 ? `${old}\n\n${notes}\n` : old.slice(0, from) + notes + old.slice(to + end.length);
+              if (updated.length > 65000) throw new Error('Release notes exceed PR body limit');
+              await github.rest.pulls.update({owner, repo, pull_number: number, body: updated});
+              try {
+                await github.rest.pulls.update({owner, repo, pull_number: number, state: 'open'});
+              } catch (error) {
+                throw new Error(`GitHub would not reopen #${number} (${error.message}). Reopen it by hand, then run this workflow again.`);
+              }
+              core.info(`Reopened #${number} with fresh release notes`);
+              return notes;
+            };
+            const reopened = /^[1-9]\d*$/.test(process.env.REOPEN_PR || '') ? await reopen(Number(process.env.REOPEN_PR)) : undefined;
+            // Read the reopened PR directly: the PR list can briefly still show it as closed.
+            let pr = reopened ? (await github.rest.pulls.get({owner, repo, pull_number: Number(process.env.REOPEN_PR)})).data : await findPR();
+            if (reopened && (!sameIdentity(pr) || pr.state !== 'open')) throw new Error('Reopened release PR is not open');
             for (const [name, color] of [['release', '0E8A16'], ['automated', 'EDEDED']]) {
               try { await github.rest.issues.getLabel({owner, repo, name}); }
               catch (error) {
@@ -256,6 +404,7 @@ jobs:
               }
             }
             let body;
+            if (reopened) body = reopened;
             if (!pr) {
               const notes = fs.readFileSync(process.env.NOTES_FILE, 'utf8');
               body = `## Release v${version}\n\n${notes}\n\n### Checklist\n- [ ] Tests pass\n- [ ] Ready for production\n`;
