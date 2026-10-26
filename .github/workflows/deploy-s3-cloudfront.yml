@@ -234,6 +234,13 @@ jobs:
   build-and-deploy:
     name: Build and Deploy to ${{ needs.setup.outputs.environment }}
     needs: setup
+    # One deploy per repo and environment at a time: two overlapping uploads to the same
+    # bucket can leave index.html pointing at the other run's files. GitHub keeps at most one
+    # run waiting and a newer one replaces it, so a burst of merges deploys the running commit
+    # plus the newest. Not cancel-in-progress: stopping a run mid-upload breaks the site.
+    concurrency:
+      group: deploy-s3-${{ github.repository }}-${{ needs.setup.outputs.environment }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     environment: ${{ needs.setup.outputs.environment }}
 
