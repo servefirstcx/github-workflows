@@ -218,6 +218,14 @@ jobs:
   build-and-deploy:
     name: Build and Deploy to ${{ needs.setup.outputs.environment }}
     needs: setup
+    # One deploy per service at a time. Without this, merges in quick succession start
+    # parallel runs that race to update the same ECS service, so an older commit can land
+    # last. GitHub keeps at most one run waiting and a newer one replaces it, so a burst of
+    # merges deploys the running commit plus the newest. Not cancel-in-progress: stopping a
+    # run mid-deploy would leave the service half rolled out.
+    concurrency:
+      group: deploy-ecs-${{ needs.setup.outputs.ecs_cluster }}-${{ needs.setup.outputs.ecs_service }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     environment: ${{ needs.setup.outputs.environment }}
 
