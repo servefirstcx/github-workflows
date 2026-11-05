@@ -10,9 +10,11 @@ name: Reusable PR Preview Workflow
 # - A run does not blindly publish "its" build or delete "its" folder. Holding the group, it
 #   reconciles: read the PR, make the preview match (closed -> remove; open -> publish the
 #   build of the PR's CURRENT head commit, from whichever run of the caller workflow built
-#   it; head not built yet -> leave it), then read the PR again and repeat until two reads in
-#   a row agree with what it last did. A stale or changing read therefore gets corrected in
-#   the same run; if the PR keeps changing for several rounds the run fails (rerun it).
+#   it; head not built yet -> leave it), then read the PR again and repeat until a read agrees
+#   with what it last did. A change during the run, or a stale read that GitHub corrects
+#   within the pause between reads, is fixed in the same run; if the PR keeps changing for
+#   several rounds the run fails (rerun it). Any API or download error fails the run rather
+#   than being read as "closed" or "no build".
 # - GitHub keeps only the newest pending run in a group and drops older pending ones. A run
 #   only reaches the group after its build uploaded the artifact, so the surviving run can
 #   publish a dropped run's build. Limits, by design: a commit whose build fails keeps the
@@ -136,20 +138,33 @@ jobs:
           WF_FILE="${CALLER_WORKFLOW_REF%%@*}"
           WF_FILE="${WF_FILE##*/}"
 
+          # Sets STATE and HEAD. Fails the run on an API error or an unexpected answer, so an
+          # unreadable PR can never be mistaken for a closed one.
           read_pr() {
-            gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '"\(.state) \(.head.sha)"'
+            local info
+            info=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '"\(.state) \(.head.sha)"') || {
+              echo "❌ Could not read PR #${PR_NUMBER}"; exit 1; }
+            read -r STATE HEAD <<< "$info"
+            case "$STATE" in
+              open|closed) ;;
+              *) echo "❌ Unexpected PR state '${STATE}'"; exit 1 ;;
+            esac
+            [[ "$HEAD" =~ ^[0-9a-f]{40}$ ]] || { echo "❌ Unexpected head sha '${HEAD}'"; exit 1; }
           }
 
           # Newest run of the caller workflow for this commit that still has the build artifact.
           find_build() {
             local runs run n
+            # An API error must fail the run, never look like "no build" (bash drops errexit
+            # inside command substitutions, so each one is checked explicitly).
             runs=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${WF_FILE}/runs?head_sha=$1&event=pull_request&per_page=30" \
-              --jq '.workflow_runs | sort_by(.created_at) | reverse | .[].id')
+              --jq '.workflow_runs | sort_by(.created_at) | reverse | .[].id') || return 1
             for run in $runs; do
               n=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run}/artifacts?name=${ARTIFACT_NAME}" \
-                --jq '[.artifacts[] | select(.expired == false)] | length')
+                --jq '[.artifacts[] | select(.expired == false)] | length') || return 1
               if [[ "$n" -gt 0 ]]; then echo "$run"; return 0; fi
             done
+            return 0
           }
 
           invalidate() {
@@ -177,7 +192,8 @@ jobs:
           do_publish() {
             local sha="$1" run="$2"
             rm -rf "${SITE_DIR}"
-            gh run download "$run" -n "$ARTIFACT_NAME" -D "${SITE_DIR}"
+            # --repo: this job has no checkout, so gh can't infer the repository from git.
+            gh run download "$run" --repo "$GITHUB_REPOSITORY" -n "$ARTIFACT_NAME" -D "${SITE_DIR}"
             if [[ ! -f "${SITE_DIR}/index.html" ]]; then
               echo "❌ Artifact '${ARTIFACT_NAME}' of run ${run} has no index.html at its root."
               exit 1
@@ -219,18 +235,17 @@ jobs:
 
           applied=""
           for round in 1 2 3 4 5; do
-            read -r STATE HEAD <<< "$(read_pr)"
+            read_pr
             # Our own build's run finding another head first: the API may still be catching up
             # with the push, so give it a moment and read again before acting on it.
             if [[ $round -eq 1 && "$STATE" == "open" && "$HEAD" != "$RUN_SHA" ]]; then
               sleep "$SETTLE"
-              read -r STATE HEAD <<< "$(read_pr)"
+              read_pr
             fi
             if [[ "$STATE" != "open" ]]; then
               want="remove"
             else
-              [[ "$HEAD" =~ ^[0-9a-f]{40}$ ]] || { echo "❌ Unexpected head sha '$HEAD'"; exit 1; }
-              SRC=$(find_build "$HEAD")
+              SRC=$(find_build "$HEAD") || { echo "❌ Could not look up builds of ${HEAD:0:7}"; exit 1; }
               if [[ -n "$SRC" ]]; then want="publish ${HEAD} ${SRC}"; else want="wait ${HEAD}"; fi
             fi
             if [[ "$want" == "$applied" ]]; then

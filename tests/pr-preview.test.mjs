@@ -49,6 +49,8 @@ const save = () => fs.writeFileSync(${JSON.stringify(world)}, JSON.stringify(w))
 const log = s => fs.appendFileSync(${JSON.stringify(log)}, s + '\\n');
 const a = process.argv.slice(2);
 if (a[0] === 'run' && a[1] === 'download') {
+  // Like real gh in a job with no checkout: without --repo there is no repository to use.
+  if (a[a.indexOf('--repo') + 1] !== 'servefirstcx/sf-admin' || !a.includes('--repo')) { console.error('not a git repository'); process.exit(1); }
   const d = a[a.indexOf('-D') + 1];
   fs.mkdirSync(d + '/assets', {recursive: true});
   fs.writeFileSync(d + '/index.html', 'built by ' + a[2]);
@@ -64,11 +66,13 @@ if (a.includes('PATCH') || a.includes('POST')) {
 }
 if (/\\/pulls\\/\\d+$/.test(path)) {
   const r = w.reads.length > 1 ? w.reads.shift() : w.reads[0];
-  save(); log('read ' + r.slice(0, 13)); console.log(r); process.exit(0);
+  save(); log('read ' + r.slice(0, 13));
+  if (r === 'ERR') process.exit(1);
+  console.log(r); process.exit(0);
 }
 let m = path.match(/workflows\\/([^/]+)\\/runs\\?head_sha=([0-9a-f]+)/);
-if (m) { if (m[1] !== 'pr-preview.yml') process.exit(4); for (const id of (w.builds[m[2]] || [])) console.log(id); process.exit(0); }
-if (/\\/runs\\/\\d+\\/artifacts/.test(path)) { console.log(1); process.exit(0); }
+if (m) { if (w.runsErr || m[1] !== 'pr-preview.yml') process.exit(4); for (const id of (w.builds[m[2]] || [])) console.log(id); process.exit(0); }
+if (/\\/runs\\/\\d+\\/artifacts/.test(path)) { if (w.artifactsErr) process.exit(5); console.log(1); process.exit(0); }
 if (/\\/issues\\/\\d+\\/comments$/.test(path)) { if (w.comment) console.log(w.comment); process.exit(0); }
 process.exit(3);
 `, {mode: 0o755});
@@ -79,8 +83,8 @@ exit 0
 `, {mode: 0o755});
 writeFileSync(join(dir, 'bin', 'sleep'), '#!/bin/bash\nexit 0\n', {mode: 0o755});
 
-function reconcile({action = 'publish', runSha = A, reads, builds = {}, comment = 7}) {
-  writeFileSync(world, JSON.stringify({reads, builds, comment}));
+function reconcile({action = 'publish', runSha = A, reads, builds = {}, comment = 7, runsErr = false, artifactsErr = false}) {
+  writeFileSync(world, JSON.stringify({reads, builds, comment, runsErr, artifactsErr}));
   writeFileSync(log, '');
   const out = join(dir, 'out');
   writeFileSync(out, '');
@@ -181,6 +185,24 @@ test('a PR that keeps changing fails the run visibly instead of reporting succes
   const r = reconcile({runSha: B, reads, builds: {[A]: [100], [B]: [101]}});
   assert.notEqual(r.status, 0);
   assert.match(r.stdout, /kept changing/);
+});
+
+test('an unreadable PR fails the run and never deletes or comments', () => {
+  for (const reads of [['ERR'], [`open ${A}`, 'ERR'], ['closedish ' + A], ['open nope']]) {
+    const r = reconcile({reads, builds: {[A]: [100]}});
+    assert.notEqual(r.status, 0, JSON.stringify(reads));
+    assert.ok(!r.removed, JSON.stringify(reads));
+    assert.ok(!r.comments.includes('patch removed'), JSON.stringify(reads));
+  }
+});
+
+test('a failed build lookup fails the run instead of reporting "no build yet"', () => {
+  for (const err of [{runsErr: true}, {artifactsErr: true}]) {
+    const r = reconcile({reads: [`open ${A}`], builds: {[A]: [100]}, ...err});
+    assert.notEqual(r.status, 0, JSON.stringify(err));
+    assert.notEqual(r.outputs.mode, 'wait');
+    assert.equal(r.index, 0);
+  }
 });
 
 test('one run at a time per PR and app, never cancelled; pull_request events only', () => {

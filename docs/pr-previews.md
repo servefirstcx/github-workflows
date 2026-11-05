@@ -27,9 +27,10 @@ that started it:
   comes from the newest run of the caller workflow for that commit that still has the
   artifact, so a late run for an older commit publishes the newer one, never its own.
   **Open, no build for the head yet:** leave the preview as it is.
-- Then it reads the PR again and repeats until a read agrees with what it last did, so a
-  stale API answer or a change mid-run is corrected in the same run. If the PR keeps
-  changing for 5 rounds the run fails; rerun it.
+- Then it reads the PR again and repeats until a read agrees with what it last did, so a change
+  mid-run, or a stale API answer that GitHub corrects within the pause between reads, is fixed
+  in the same run. If the PR keeps changing for 5 rounds the run fails; rerun it. An API or
+  download error also fails the run (it is never read as "closed" or "no build").
 - GitHub keeps only the newest pending run in a group and drops older pending ones. A run
   only joins the group after its build uploaded the artifact, so the surviving run can still
   publish a dropped run's build.
