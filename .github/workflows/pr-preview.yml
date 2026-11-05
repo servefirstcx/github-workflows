@@ -1,0 +1,268 @@
+name: Reusable PR Preview Workflow
+
+# Publishes an already built static site as a per-PR preview on stage, or removes it.
+#   https://<app>-pr-<N>.preview.servefirst.co.uk -> s3://preview.servefirst.co.uk/<app>/pr-<N>/
+# The preview talks to the stage API and stage data. Caller wiring: docs/pr-previews.md.
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: "Preview app: 'app' (sf-react-app) or 'admin' (sf-admin)"
+        required: true
+        type: string
+      artifact_name:
+        description: "Actions artifact (from the calling run) holding the built site root; unused for cleanup"
+        required: false
+        type: string
+        default: ""
+      action:
+        description: "'publish' (upload and comment) or 'cleanup' (delete the folder when the PR closes)"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  preview:
+    name: PR preview ${{ inputs.action }} (${{ inputs.app_name }})
+    # Fork PRs and non-PR events skip the job, so the deploy role is never assumed for them.
+    if: >-
+      github.event.pull_request != null &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    # Job level, not workflow level: inside a reusable workflow a workflow-level group
+    # shares the caller's namespace (github.workflow is the caller's name) and can deadlock.
+    # One group per repo + PR + app for both actions:
+    # - publish cancels a running publish, so the newest push wins;
+    # - cleanup sets cancel-in-progress false, so it waits for a running publish to finish
+    #   instead of racing it (a separate group would let a slow publish re-upload after the
+    #   folder was deleted). Only a publish after a reopen can replace cleanup, and then the
+    #   preview should exist again anyway.
+    concurrency:
+      group: pr-preview-${{ github.repository }}-${{ github.event.pull_request.number }}-${{ inputs.app_name }}
+      cancel-in-progress: ${{ inputs.action == 'publish' }}
+    runs-on: ubuntu-latest
+    env:
+      APP_NAME: ${{ inputs.app_name }}
+      PREVIEW_ACTION: ${{ inputs.action }}
+      ARTIFACT_NAME: ${{ inputs.artifact_name }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      AWS_ROLE: arn:aws:iam::068531097348:role/stage-github-actions-preview
+      BUCKET: preview.servefirst.co.uk
+      AWS_REGION_NAME: eu-west-2
+      PREVIEW_ALIAS: "*.preview.servefirst.co.uk"
+      SITE_DIR: preview-site
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Validate inputs
+        id: vars
+        run: |
+          set -euo pipefail
+          case "$APP_NAME" in
+            app|admin) ;;
+            *) echo "❌ app_name must be 'app' or 'admin', got '$APP_NAME'"; exit 1 ;;
+          esac
+          case "$PREVIEW_ACTION" in
+            publish|cleanup) ;;
+            *) echo "❌ action must be 'publish' or 'cleanup', got '$PREVIEW_ACTION'"; exit 1 ;;
+          esac
+          if [[ "$PREVIEW_ACTION" == "publish" && -z "$ARTIFACT_NAME" ]]; then
+            echo "❌ artifact_name is required for publish"
+            exit 1
+          fi
+          if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]{0,5}$ ]]; then
+            echo "❌ Unexpected PR number '$PR_NUMBER'"
+            exit 1
+          fi
+          {
+            echo "prefix=${APP_NAME}/pr-${PR_NUMBER}"
+            echo "url=https://${APP_NAME}-pr-${PR_NUMBER}.preview.servefirst.co.uk"
+            echo "marker=<!-- pr-preview:${APP_NAME} -->"
+            echo "short_sha=${HEAD_SHA:0:7}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check this is still the newest commit of an open PR
+        id: current
+        if: ${{ inputs.action == 'publish' }}
+        run: |
+          set -euo pipefail
+          # Concurrency only cancels runs that overlap. A slow build of an older push can
+          # reach this job after the newer one finished, or after the PR closed and was
+          # cleaned up; publishing it then would put an older build live.
+          # Captured first: `read < <(gh ...)` would hide a failed API call.
+          PR_INFO=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '"\(.state) \(.head.sha)"')
+          read -r STATE LIVE_SHA <<< "$PR_INFO"
+          if [[ "$STATE" != "open" || "$LIVE_SHA" != "$HEAD_SHA" ]]; then
+            echo "ℹ️  PR is $STATE at ${LIVE_SHA:0:7}; this run is for ${HEAD_SHA:0:7}. Skipping publish."
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download build artifact
+        if: ${{ inputs.action == 'publish' && steps.current.outputs.stale == 'false' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: ${{ env.SITE_DIR }}
+
+      - name: Check build artifact
+        if: ${{ inputs.action == 'publish' && steps.current.outputs.stale == 'false' }}
+        run: |
+          set -euo pipefail
+          # Checked before the role is assumed: a wrong artifact should fail while nothing changed.
+          if [[ ! -f "${SITE_DIR}/index.html" ]]; then
+            echo "❌ Artifact '${ARTIFACT_NAME}' has no index.html at its root (upload the build dir's contents)."
+            exit 1
+          fi
+
+      - name: Configure AWS credentials
+        if: ${{ inputs.action == 'cleanup' || steps.current.outputs.stale == 'false' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE }}
+          aws-region: ${{ env.AWS_REGION_NAME }}
+
+      - name: Find preview CloudFront distribution
+        id: cdn
+        if: ${{ inputs.action == 'cleanup' || steps.current.outputs.stale == 'false' }}
+        run: |
+          set -euo pipefail
+          # Found by alias so callers need no repo variables (the role may list distributions).
+          IDS=$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?contains(Aliases.Items || \`[]\`, '${PREVIEW_ALIAS}')].Id" \
+            --output text)
+          # Text output prints "None" when the account has no distributions at all.
+          [[ "$IDS" == "None" ]] && IDS=""
+          read -r -a ID_LIST <<< "$IDS"
+          if [[ ${#ID_LIST[@]} -ne 1 ]]; then
+            echo "❌ Expected one CloudFront distribution with alias ${PREVIEW_ALIAS}, found ${#ID_LIST[@]}: ${IDS}"
+            exit 1
+          fi
+          echo "✅ Preview distribution: ${ID_LIST[0]}"
+          echo "id=${ID_LIST[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload preview to S3
+        if: ${{ inputs.action == 'publish' && steps.current.outputs.stale == 'false' }}
+        env:
+          PREFIX: ${{ steps.vars.outputs.prefix }}
+        run: |
+          set -euo pipefail
+          DEST="s3://${BUCKET}/${PREFIX}"
+          # Hashed bundles (Vite dist/assets, CRA build/static) get a new name on every
+          # change, so browsers may keep them; uploaded before index.html references them.
+          HASHED_DIRS=(assets static)
+          for DIR in "${HASHED_DIRS[@]}"; do
+            if [[ -d "${SITE_DIR}/${DIR}" ]]; then
+              echo "🚀 Syncing hashed ${DIR}/ to ${DEST}/${DIR}/"
+              aws s3 sync "${SITE_DIR}/${DIR}" "${DEST}/${DIR}/" --delete \
+                --cache-control "public, max-age=31536000, immutable"
+            fi
+          done
+          # Everything else keeps the default headers, as in deploy-s3-cloudfront.yml.
+          # --delete is safe: the folder belongs to this PR and the newest build replaces it.
+          echo "🚀 Syncing ${SITE_DIR}/ to ${DEST}/"
+          aws s3 sync "${SITE_DIR}" "${DEST}/" --delete \
+            --exclude "index.html" --exclude "assets/*" --exclude "static/*"
+          echo "📄 Uploading index.html last with no-cache headers"
+          aws s3 cp \
+            --cache-control "max-age=0, no-cache, no-store, must-revalidate" \
+            --content-type "text/html" \
+            "${SITE_DIR}/index.html" "${DEST}/index.html"
+
+      - name: Remove preview from S3
+        if: ${{ inputs.action == 'cleanup' }}
+        env:
+          PREFIX: ${{ steps.vars.outputs.prefix }}
+        run: |
+          set -euo pipefail
+          echo "🗑️  Removing s3://${BUCKET}/${PREFIX}/"
+          aws s3 rm "s3://${BUCKET}/${PREFIX}/" --recursive
+
+      - name: Invalidate CloudFront cache
+        if: ${{ inputs.action == 'cleanup' || steps.current.outputs.stale == 'false' }}
+        env:
+          DISTRIBUTION_ID: ${{ steps.cdn.outputs.id }}
+          PREFIX: ${{ steps.vars.outputs.prefix }}
+        run: |
+          set -euo pipefail
+          # Only this PR's prefix, not "/*": the viewer-request function rewrites
+          # /<uri> on <app>-pr-<N>.preview... to /<app>/pr-<N><uri> before the cache
+          # lookup, so every cached object of this preview has a key under that prefix,
+          # and other PRs' previews keep their caches.
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id "${DISTRIBUTION_ID}" \
+            --paths "/${PREFIX}/*" \
+            --query 'Invalidation.Id' \
+            --output text)
+          echo "✅ Invalidation created: $INVALIDATION_ID"
+
+      - name: Update sticky PR comment
+        if: ${{ inputs.action == 'cleanup' || steps.current.outputs.stale == 'false' }}
+        env:
+          MARKER: ${{ steps.vars.outputs.marker }}
+          PREVIEW_URL: ${{ steps.vars.outputs.url }}
+          SHORT_SHA: ${{ steps.vars.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          # One comment per app, found by its hidden marker among this bot's comments,
+          # and edited in place so later pushes never add another.
+          COMMENT_IDS=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"${MARKER}\"))) | .id")
+          COMMENT_ID="${COMMENT_IDS%%$'\n'*}"
+          NOW=$(date -u '+%Y-%m-%d %H:%M UTC')
+          if [[ "$PREVIEW_ACTION" == "publish" ]]; then
+            BODY="${MARKER}
+          ### 🔍 Preview (${APP_NAME}): ${PREVIEW_URL}
+
+          - **Commit:** \`${SHORT_SHA}\`
+          - **Built:** ${NOW}
+          - Talks to the **stage API, stage data**.
+
+          Updated on every push to this PR; removed when it closes."
+          else
+            if [[ -z "$COMMENT_ID" ]]; then
+              echo "ℹ️  No preview comment to update."
+              exit 0
+            fi
+            BODY="${MARKER}
+          ### 🗑️ Preview (${APP_NAME}) removed
+
+          This PR closed, so ${PREVIEW_URL} was deleted on ${NOW}."
+          fi
+          if [[ -n "$COMMENT_ID" ]]; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}" -f body="$BODY" --silent
+            echo "✅ Updated comment ${COMMENT_ID}"
+          else
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -f body="$BODY" --silent
+            echo "✅ Posted preview comment"
+          fi
+
+      - name: Create preview summary
+        if: always()
+        env:
+          PREVIEW_URL: ${{ steps.vars.outputs.url }}
+          PREFIX: ${{ steps.vars.outputs.prefix }}
+          STALE: ${{ steps.current.outputs.stale }}
+          DISTRIBUTION_ID: ${{ steps.cdn.outputs.id }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "## 🔍 PR preview ${PREVIEW_ACTION} (${APP_NAME})"
+            echo ""
+            echo "- **Status:** ${JOB_STATUS}"
+            echo "- **PR:** #${PR_NUMBER}"
+            echo "- **Commit:** ${HEAD_SHA}"
+            if [[ "$STALE" == "true" ]]; then
+              echo "- **Skipped:** the PR is closed or has a newer commit; that run publishes instead."
+            elif [[ "$PREVIEW_ACTION" == "publish" ]]; then
+              echo "- **URL:** ${PREVIEW_URL} (stage API, stage data)"
+            fi
+            echo "- **S3:** s3://${BUCKET}/${PREFIX}/"
+            echo "- **CloudFront:** ${DISTRIBUTION_ID:-not looked up}"
+          } >> "$GITHUB_STEP_SUMMARY"
