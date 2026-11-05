@@ -8,25 +8,31 @@ Every pull request into `stage` gets its own copy of the web app or admin app:
 | `admin` | sf-admin | `https://admin-pr-N.preview.servefirst.co.uk` |
 
 Previews talk to the **stage API, with stage data**. The PR gets one comment with the
-link and the commit it was built from, edited in place on every push. When the PR closes
+link and the commit it shows, edited in place on every push. When the PR closes
 or merges, the preview is deleted and the comment says so. Files left behind expire
 after 14 days anyway (bucket lifecycle).
 
 ## What the workflow does
 
-- `action: publish` downloads the build artifact, checks the PR is still open at this
-  commit (otherwise a newer run publishes instead), uploads it to
-  `s3://preview.servefirst.co.uk/<app>/pr-<N>/` (hashed `assets/` and `static/` files
-  with a long cache, `index.html` last with `no-cache`), invalidates `/<app>/pr-<N>/*`
-  and updates the comment.
-- `action: cleanup` deletes the folder, invalidates it and edits the comment, but only if
-  the PR is still closed when it runs (a delayed cleanup never deletes a reopened PR's preview).
+Each run makes the preview match the PR as it is right now, instead of acting on the event
+that started it:
+
+- One run at a time per repo + PR + app (job-level concurrency group, never cancelled), so
+  no two runs write the folder or the comment at once.
+- Holding the group, the run reads the PR. **Closed:** delete
+  `s3://preview.servefirst.co.uk/<app>/pr-<N>/`, invalidate it and mark the comment
+  removed. **Open:** publish the build of the PR's current head commit (hashed `assets/` and
+  `static/` with a long cache, `index.html` last with `no-cache`, `--delete` so the folder
+  holds exactly that build), invalidate `/<app>/pr-<N>/*` and point the comment at that
+  commit. The build artifact comes from whichever run of the caller workflow built that
+  commit, so a late run for an older commit publishes the newer one, never its own.
+  **Open, head not built yet:** change nothing; that build's own run publishes it.
+- GitHub keeps only the newest pending run in a group and drops older pending ones. That is
+  safe because the surviving run reconciles to the live state and so does the dropped run's
+  work. Every push, close and reopen starts a run after the change, so the last run to
+  execute always sees the final state. `publish` and `cleanup` differ only in when the
+  caller starts them.
 - Fork PRs and anything but `pull_request` events skip the job, so the deploy role is never assumed.
-- No concurrency group (a group keeps one pending run and would let a late, out-of-date build
-  knock out the newest one). Instead each write re-reads the PR first: `index.html` (the switch
-  to a new build) is uploaded only while the run is still the PR's newest commit, and a publish
-  that finds the PR closed after uploading removes the folder itself. Uploads are additive, so
-  an older build's leftover files stay until the bucket's 14-day expiry.
 
 Fixed in the workflow (no secrets or repo variables needed): role
 `arn:aws:iam::068531097348:role/stage-github-actions-preview` (trusts only
@@ -68,7 +74,7 @@ jobs:
         with:
           name: preview-site
           path: dist # sf-react-app: build
-          retention-days: 1
+          retention-days: 3
 
   publish:
     needs: build
@@ -77,6 +83,7 @@ jobs:
       id-token: write
       contents: read
       pull-requests: write
+      actions: read # to fetch the head commit's build from another run
     with:
       app_name: admin # sf-react-app: app
       artifact_name: preview-site
@@ -89,13 +96,16 @@ jobs:
       id-token: write
       contents: read
       pull-requests: write
+      actions: read
     with:
       app_name: admin # sf-react-app: app
+      artifact_name: preview-site # a cleanup that finds the PR reopened publishes its head
       action: cleanup
 ```
 
 Notes:
 
 - Upload the build directory itself as the artifact: `index.html` must be at its root.
+- Use the same `artifact_name` for publish and cleanup: it is how a run finds another run's build.
 - Don't add a `concurrency` group with `cancel-in-progress` around the publish or cleanup
-  jobs in the caller: a cancelled cleanup leaves a closed PR's preview up until it expires.
+  jobs in the caller: cancelling them is what the shared job's design avoids.
