@@ -157,6 +157,11 @@ jobs:
           # Hashed bundles (Vite dist/assets, CRA build/static) get a new name on every
           # change, so browsers may keep them; uploaded before index.html references them.
           HASHED_DIRS=(assets static)
+          # Every file is re-uploaded on each publish (this matters: the bucket expires objects
+          # 14 days after upload, so an unchanged chunk must not keep its old upload date while
+          # index.html gets a new one). aws s3 sync uploads a file when its local time is newer
+          # than the stored object, and every file of a fresh CI build is newer, so plain sync
+          # re-uploads all of them.
           for DIR in "${HASHED_DIRS[@]}"; do
             if [[ -d "${SITE_DIR}/${DIR}" ]]; then
               echo "🚀 Syncing hashed ${DIR}/ to ${DEST}/${DIR}/"
