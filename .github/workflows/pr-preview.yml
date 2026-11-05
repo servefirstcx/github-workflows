@@ -29,21 +29,23 @@ permissions:
 jobs:
   preview:
     name: PR preview ${{ inputs.action }} (${{ inputs.app_name }})
-    # Fork PRs and non-PR events skip the job, so the deploy role is never assumed for them.
+    # Fork PRs and anything but a pull_request event skip the job, so the deploy role is
+    # never assumed for them (pull_request_target also carries a pull_request payload).
     if: >-
+      github.event_name == 'pull_request' &&
       github.event.pull_request != null &&
       github.event.pull_request.head.repo.full_name == github.repository
-    # Job level, not workflow level: inside a reusable workflow a workflow-level group
-    # shares the caller's namespace (github.workflow is the caller's name) and can deadlock.
-    # One group per repo + PR + app for both actions:
-    # - publish cancels a running publish, so the newest push wins;
-    # - cleanup sets cancel-in-progress false, so it waits for a running publish to finish
-    #   instead of racing it (a separate group would let a slow publish re-upload after the
-    #   folder was deleted). Only a publish after a reopen can replace cleanup, and then the
-    #   preview should exist again anyway.
-    concurrency:
-      group: pr-preview-${{ github.repository }}-${{ github.event.pull_request.number }}-${{ inputs.app_name }}
-      cancel-in-progress: ${{ inputs.action == 'publish' }}
+    # Deliberately no concurrency group. A group keeps only one pending run and cancels the
+    # older pending one, so a slow, out-of-date build arriving late could knock out the run
+    # for the newest commit (or a cleanup). Instead every write re-reads the PR from the API
+    # just before it acts:
+    # - publish uploads only while the PR is open at this run's commit, uploads index.html
+    #   (the switch to the new build) only if that still holds, and removes the folder itself
+    #   if the PR closed while it was uploading;
+    # - cleanup deletes only if the PR is still closed when it runs, so a delayed or rerun
+    #   cleanup can't delete the preview of a reopened PR.
+    # Uploads are additive (no --delete), so two publishes running at once can't remove each
+    # other's files; an older build's leftover files expire with the bucket's 14-day rule.
     runs-on: ubuntu-latest
     env:
       APP_NAME: ${{ inputs.app_name }}
@@ -79,6 +81,25 @@ jobs:
             echo "❌ Unexpected PR number '$PR_NUMBER'"
             exit 1
           fi
+          # pr_state prints "<state> <head sha>" for this PR, read live from the API. Every
+          # write step sources it and re-checks just before acting (see the comment on the job).
+          cat > "${RUNNER_TEMP}/pr-state.sh" <<'EOF'
+          pr_state() {
+            gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '"\(.state) \(.head.sha)"'
+          }
+          is_current() {
+            local info state sha
+            info=$(pr_state) || return 2
+            read -r state sha <<< "$info"
+            [[ "$state" == "open" && "$sha" == "$HEAD_SHA" ]]
+          }
+          is_closed() {
+            local info state sha
+            info=$(pr_state) || return 2
+            read -r state sha <<< "$info"
+            [[ "$state" == "closed" ]]
+          }
+          EOF
           {
             echo "prefix=${APP_NAME}/pr-${PR_NUMBER}"
             echo "url=https://${APP_NAME}-pr-${PR_NUMBER}.preview.servefirst.co.uk"
@@ -91,14 +112,14 @@ jobs:
         if: ${{ inputs.action == 'publish' }}
         run: |
           set -euo pipefail
-          # Concurrency only cancels runs that overlap. A slow build of an older push can
-          # reach this job after the newer one finished, or after the PR closed and was
-          # cleaned up; publishing it then would put an older build live.
-          # Captured first: `read < <(gh ...)` would hide a failed API call.
-          PR_INFO=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '"\(.state) \(.head.sha)"')
-          read -r STATE LIVE_SHA <<< "$PR_INFO"
-          if [[ "$STATE" != "open" || "$LIVE_SHA" != "$HEAD_SHA" ]]; then
-            echo "ℹ️  PR is $STATE at ${LIVE_SHA:0:7}; this run is for ${HEAD_SHA:0:7}. Skipping publish."
+          # A slow build of an older push can reach this job after a newer one, or after the
+          # PR closed; publishing it would put an older build live. Checked again before
+          # index.html is uploaded.
+          source "${RUNNER_TEMP}/pr-state.sh"
+          rc=0; is_current || rc=$?
+          if [[ $rc -eq 2 ]]; then echo "❌ Could not read the PR"; exit 1; fi
+          if [[ $rc -ne 0 ]]; then
+            echo "ℹ️  PR is closed or has moved on from ${HEAD_SHA:0:7}. Skipping publish."
             echo "stale=true" >> "$GITHUB_OUTPUT"
           else
             echo "stale=false" >> "$GITHUB_OUTPUT"
@@ -121,8 +142,24 @@ jobs:
             exit 1
           fi
 
+      - name: Check the PR is still closed
+        id: closed
+        if: ${{ inputs.action == 'cleanup' }}
+        run: |
+          set -euo pipefail
+          # A delayed or rerun cleanup must not delete the preview of a reopened PR.
+          source "${RUNNER_TEMP}/pr-state.sh"
+          rc=0; is_closed || rc=$?
+          if [[ $rc -eq 2 ]]; then echo "❌ Could not read the PR"; exit 1; fi
+          if [[ $rc -ne 0 ]]; then
+            echo "ℹ️  PR is open again. Skipping cleanup."
+            echo "reopened=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "reopened=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Configure AWS credentials
-        if: ${{ inputs.action == 'cleanup' || steps.current.outputs.stale == 'false' }}
+        if: ${{ steps.closed.outputs.reopened == 'false' || steps.current.outputs.stale == 'false' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.AWS_ROLE }}
@@ -130,7 +167,7 @@ jobs:
 
       - name: Find preview CloudFront distribution
         id: cdn
-        if: ${{ inputs.action == 'cleanup' || steps.current.outputs.stale == 'false' }}
+        if: ${{ steps.closed.outputs.reopened == 'false' || steps.current.outputs.stale == 'false' }}
         run: |
           set -euo pipefail
           # Found by alias so callers need no repo variables (the role may list distributions).
@@ -148,11 +185,13 @@ jobs:
           echo "id=${ID_LIST[0]}" >> "$GITHUB_OUTPUT"
 
       - name: Upload preview to S3
+        id: upload
         if: ${{ inputs.action == 'publish' && steps.current.outputs.stale == 'false' }}
         env:
           PREFIX: ${{ steps.vars.outputs.prefix }}
         run: |
           set -euo pipefail
+          source "${RUNNER_TEMP}/pr-state.sh"
           DEST="s3://${BUCKET}/${PREFIX}"
           # Hashed bundles (Vite dist/assets, CRA build/static) get a new name on every
           # change, so browsers may keep them; uploaded before index.html references them.
@@ -165,23 +204,43 @@ jobs:
           for DIR in "${HASHED_DIRS[@]}"; do
             if [[ -d "${SITE_DIR}/${DIR}" ]]; then
               echo "🚀 Syncing hashed ${DIR}/ to ${DEST}/${DIR}/"
-              aws s3 sync "${SITE_DIR}/${DIR}" "${DEST}/${DIR}/" --delete \
+              aws s3 sync "${SITE_DIR}/${DIR}" "${DEST}/${DIR}/" \
                 --cache-control "public, max-age=31536000, immutable"
             fi
           done
           # Everything else keeps the default headers, as in deploy-s3-cloudfront.yml.
-          # --delete is safe: the folder belongs to this PR and the newest build replaces it.
           echo "🚀 Syncing ${SITE_DIR}/ to ${DEST}/"
-          aws s3 sync "${SITE_DIR}" "${DEST}/" --delete \
+          aws s3 sync "${SITE_DIR}" "${DEST}/" \
             --exclude "index.html" --exclude "assets/*" --exclude "static/*"
-          echo "📄 Uploading index.html last with no-cache headers"
-          aws s3 cp \
-            --cache-control "max-age=0, no-cache, no-store, must-revalidate" \
-            --content-type "text/html" \
-            "${SITE_DIR}/index.html" "${DEST}/index.html"
+          # index.html switches the preview to this build, so only while this run is still the
+          # PR's newest commit. A newer push needs minutes to build, so it can't land between
+          # this check and the upload.
+          rc=0; is_current || rc=$?
+          if [[ $rc -eq 2 ]]; then echo "❌ Could not read the PR"; exit 1; fi
+          if [[ $rc -ne 0 ]]; then
+            echo "ℹ️  PR closed or moved on during upload. Not switching the preview to this build."
+            echo "switched=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "📄 Uploading index.html last with no-cache headers"
+            aws s3 cp \
+              --cache-control "max-age=0, no-cache, no-store, must-revalidate" \
+              --content-type "text/html" \
+              "${SITE_DIR}/index.html" "${DEST}/index.html"
+            echo "switched=true" >> "$GITHUB_OUTPUT"
+          fi
+          # The PR may have closed (and its cleanup run finished) while this upload ran. Then
+          # this run removes what it put back, so a closed PR never keeps a preview.
+          rc=0; is_closed || rc=$?
+          if [[ $rc -eq 0 ]]; then
+            echo "🗑️  PR closed during upload. Removing ${DEST}/"
+            aws s3 rm "${DEST}/" --recursive
+            echo "switched=false" >> "$GITHUB_OUTPUT"
+          elif [[ $rc -eq 2 ]]; then
+            echo "❌ Could not read the PR"; exit 1
+          fi
 
       - name: Remove preview from S3
-        if: ${{ inputs.action == 'cleanup' }}
+        if: ${{ steps.closed.outputs.reopened == 'false' }}
         env:
           PREFIX: ${{ steps.vars.outputs.prefix }}
         run: |
@@ -190,7 +249,7 @@ jobs:
           aws s3 rm "s3://${BUCKET}/${PREFIX}/" --recursive
 
       - name: Invalidate CloudFront cache
-        if: ${{ inputs.action == 'cleanup' || steps.current.outputs.stale == 'false' }}
+        if: ${{ steps.closed.outputs.reopened == 'false' || steps.upload.outcome == 'success' }}
         env:
           DISTRIBUTION_ID: ${{ steps.cdn.outputs.id }}
           PREFIX: ${{ steps.vars.outputs.prefix }}
@@ -208,7 +267,7 @@ jobs:
           echo "✅ Invalidation created: $INVALIDATION_ID"
 
       - name: Update sticky PR comment
-        if: ${{ inputs.action == 'cleanup' || steps.current.outputs.stale == 'false' }}
+        if: ${{ steps.closed.outputs.reopened == 'false' || steps.upload.outputs.switched == 'true' }}
         env:
           MARKER: ${{ steps.vars.outputs.marker }}
           PREVIEW_URL: ${{ steps.vars.outputs.url }}
@@ -253,7 +312,7 @@ jobs:
         env:
           PREVIEW_URL: ${{ steps.vars.outputs.url }}
           PREFIX: ${{ steps.vars.outputs.prefix }}
-          STALE: ${{ steps.current.outputs.stale }}
+          STALE: ${{ steps.current.outputs.stale == 'true' || steps.upload.outputs.switched == 'false' || steps.closed.outputs.reopened == 'true' }}
           DISTRIBUTION_ID: ${{ steps.cdn.outputs.id }}
           JOB_STATUS: ${{ job.status }}
         run: |
@@ -264,7 +323,7 @@ jobs:
             echo "- **PR:** #${PR_NUMBER}"
             echo "- **Commit:** ${HEAD_SHA}"
             if [[ "$STALE" == "true" ]]; then
-              echo "- **Skipped:** the PR is closed or has a newer commit; that run publishes instead."
+              echo "- **Skipped:** the PR's state changed (newer commit, closed or reopened); this run left the preview alone."
             elif [[ "$PREVIEW_ACTION" == "publish" ]]; then
               echo "- **URL:** ${PREVIEW_URL} (stage API, stage data)"
             fi

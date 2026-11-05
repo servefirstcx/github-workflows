@@ -19,10 +19,14 @@ after 14 days anyway (bucket lifecycle).
   `s3://preview.servefirst.co.uk/<app>/pr-<N>/` (hashed `assets/` and `static/` files
   with a long cache, `index.html` last with `no-cache`), invalidates `/<app>/pr-<N>/*`
   and updates the comment.
-- `action: cleanup` deletes the folder, invalidates it and edits the comment.
-- Fork PRs and non-PR events skip the job, so the deploy role is never assumed.
-- One run per repo + PR + app at a time: a new publish cancels a running one (newest
-  push wins); cleanup is never cancelled by a publish and waits for a running one.
+- `action: cleanup` deletes the folder, invalidates it and edits the comment, but only if
+  the PR is still closed when it runs (a delayed cleanup never deletes a reopened PR's preview).
+- Fork PRs and anything but `pull_request` events skip the job, so the deploy role is never assumed.
+- No concurrency group (a group keeps one pending run and would let a late, out-of-date build
+  knock out the newest one). Instead each write re-reads the PR first: `index.html` (the switch
+  to a new build) is uploaded only while the run is still the PR's newest commit, and a publish
+  that finds the PR closed after uploading removes the folder itself. Uploads are additive, so
+  an older build's leftover files stay until the bucket's 14-day expiry.
 
 Fixed in the workflow (no secrets or repo variables needed): role
 `arn:aws:iam::068531097348:role/stage-github-actions-preview` (trusts only
@@ -93,5 +97,5 @@ jobs:
 Notes:
 
 - Upload the build directory itself as the artifact: `index.html` must be at its root.
-- Don't add a workflow-level `concurrency` group named `pr-preview-...` in the caller;
-  the shared job already uses one, and a clash would deadlock.
+- Don't add a `concurrency` group with `cancel-in-progress` around the publish or cleanup
+  jobs in the caller: a cancelled cleanup leaves a closed PR's preview up until it expires.
