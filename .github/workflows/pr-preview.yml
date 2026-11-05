@@ -1,0 +1,293 @@
+name: Reusable PR Preview Workflow
+
+# Keeps a per-PR preview on stage in step with the PR:
+#   https://<app>-pr-<N>.preview.servefirst.co.uk -> s3://preview.servefirst.co.uk/<app>/pr-<N>/
+# The preview talks to the stage API and stage data. Caller wiring: docs/pr-previews.md.
+#
+# How it stays correct when runs arrive late, overlap or are dropped:
+# - One run at a time per repo + PR + app (concurrency group, never cancelled), so no two
+#   runs ever write the bucket or the comment at the same time.
+# - A run does not blindly publish "its" build or delete "its" folder. Holding the group, it
+#   reconciles: read the PR, make the preview match (closed -> remove; open -> publish the
+#   build of the PR's CURRENT head commit, from whichever run of the caller workflow built
+#   it; head not built yet -> leave it), then read the PR again and repeat until a read agrees
+#   with what it last did. A change during the run, or a stale read that GitHub corrects
+#   within the pause between reads, is fixed in the same run; if the PR keeps changing for
+#   several rounds the run fails (rerun it). Any API or download error fails the run rather
+#   than being read as "closed" or "no build".
+# - GitHub keeps only the newest pending run in a group and drops older pending ones. A run
+#   only reaches the group after its build uploaded the artifact, so the surviving run can
+#   publish a dropped run's build. Limits, by design: a commit whose build fails keeps the
+#   previous preview; a build whose artifact expired (retention set by the caller) can't be
+#   republished by a later run without rebuilding.
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: "Preview app: 'app' (sf-react-app) or 'admin' (sf-admin)"
+        required: true
+        type: string
+      artifact_name:
+        description: "Name of the build artifact (site root, index.html at the top) the caller's build job uploads"
+        required: true
+        type: string
+      action:
+        description: "'publish' (after a build) or 'cleanup' (PR closed); both reconcile to the PR's live state"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+  actions: read
+
+jobs:
+  preview:
+    name: PR preview ${{ inputs.action }} (${{ inputs.app_name }})
+    # Fork PRs and anything but a pull_request event skip the job, so the deploy role is
+    # never assumed for them (pull_request_target also carries a pull_request payload).
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request != null &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    # Job level, not workflow level: inside a reusable workflow a workflow-level group shares
+    # the caller's namespace. Never cancel a running writer (see the header).
+    concurrency:
+      group: pr-preview-${{ github.repository }}-${{ github.event.pull_request.number }}-${{ inputs.app_name }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    env:
+      APP_NAME: ${{ inputs.app_name }}
+      PREVIEW_ACTION: ${{ inputs.action }}
+      ARTIFACT_NAME: ${{ inputs.artifact_name }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      RUN_SHA: ${{ github.event.pull_request.head.sha }}
+      CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+      AWS_ROLE: arn:aws:iam::068531097348:role/stage-github-actions-preview
+      BUCKET: preview.servefirst.co.uk
+      AWS_REGION_NAME: eu-west-2
+      PREVIEW_ALIAS: "*.preview.servefirst.co.uk"
+      SITE_DIR: preview-site
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Validate inputs
+        id: vars
+        run: |
+          set -euo pipefail
+          case "$APP_NAME" in
+            app|admin) ;;
+            *) echo "❌ app_name must be 'app' or 'admin', got '$APP_NAME'"; exit 1 ;;
+          esac
+          case "$PREVIEW_ACTION" in
+            publish|cleanup) ;;
+            *) echo "❌ action must be 'publish' or 'cleanup', got '$PREVIEW_ACTION'"; exit 1 ;;
+          esac
+          if [[ -z "$ARTIFACT_NAME" ]]; then
+            echo "❌ artifact_name is required"
+            exit 1
+          fi
+          if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]{0,5}$ ]]; then
+            echo "❌ Unexpected PR number '$PR_NUMBER'"
+            exit 1
+          fi
+          {
+            echo "prefix=${APP_NAME}/pr-${PR_NUMBER}"
+            echo "url=https://${APP_NAME}-pr-${PR_NUMBER}.preview.servefirst.co.uk"
+            echo "marker=<!-- pr-preview:${APP_NAME} -->"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE }}
+          aws-region: ${{ env.AWS_REGION_NAME }}
+
+      - name: Find preview CloudFront distribution
+        id: cdn
+        run: |
+          set -euo pipefail
+          # Found by alias so callers need no repo variables (the role may list distributions).
+          IDS=$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?contains(Aliases.Items || \`[]\`, '${PREVIEW_ALIAS}')].Id" \
+            --output text)
+          # Text output prints "None" when the account has no distributions at all.
+          [[ "$IDS" == "None" ]] && IDS=""
+          read -r -a ID_LIST <<< "$IDS"
+          if [[ ${#ID_LIST[@]} -ne 1 ]]; then
+            echo "❌ Expected one CloudFront distribution with alias ${PREVIEW_ALIAS}, found ${#ID_LIST[@]}: ${IDS}"
+            exit 1
+          fi
+          echo "✅ Preview distribution: ${ID_LIST[0]}"
+          echo "id=${ID_LIST[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Reconcile the preview with the PR
+        id: reconcile
+        env:
+          PREFIX: ${{ steps.vars.outputs.prefix }}
+          MARKER: ${{ steps.vars.outputs.marker }}
+          PREVIEW_URL: ${{ steps.vars.outputs.url }}
+          DISTRIBUTION_ID: ${{ steps.cdn.outputs.id }}
+        run: |
+          set -euo pipefail
+          DEST="s3://${BUCKET}/${PREFIX}"
+          SETTLE="${PREVIEW_SETTLE_SECONDS:-10}"
+          # Runs of the caller's workflow file (github.workflow_ref is "owner/repo/<path>@ref").
+          WF_FILE="${CALLER_WORKFLOW_REF%%@*}"
+          WF_FILE="${WF_FILE##*/}"
+
+          # Sets STATE and HEAD. Fails the run on an API error or an unexpected answer, so an
+          # unreadable PR can never be mistaken for a closed one.
+          read_pr() {
+            local info
+            info=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '"\(.state) \(.head.sha)"') || {
+              echo "❌ Could not read PR #${PR_NUMBER}"; exit 1; }
+            read -r STATE HEAD <<< "$info"
+            case "$STATE" in
+              open|closed) ;;
+              *) echo "❌ Unexpected PR state '${STATE}'"; exit 1 ;;
+            esac
+            [[ "$HEAD" =~ ^[0-9a-f]{40}$ ]] || { echo "❌ Unexpected head sha '${HEAD}'"; exit 1; }
+          }
+
+          # Newest run of the caller workflow for this commit that still has the build artifact.
+          find_build() {
+            local runs run n
+            # An API error must fail the run, never look like "no build" (bash drops errexit
+            # inside command substitutions, so each one is checked explicitly).
+            runs=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${WF_FILE}/runs?head_sha=$1&event=pull_request&per_page=30" \
+              --jq '.workflow_runs | sort_by(.created_at) | reverse | .[].id') || return 1
+            for run in $runs; do
+              n=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run}/artifacts?name=${ARTIFACT_NAME}" \
+                --jq '[.artifacts[] | select(.expired == false)] | length') || return 1
+              if [[ "$n" -gt 0 ]]; then echo "$run"; return 0; fi
+            done
+            return 0
+          }
+
+          invalidate() {
+            # Only this PR's prefix, not "/*": the viewer-request function rewrites the URI to
+            # /<app>/pr-<N><uri> before the cache lookup, so this preview's cache keys all sit
+            # under that prefix and other previews keep their caches.
+            aws cloudfront create-invalidation --distribution-id "${DISTRIBUTION_ID}" \
+              --paths "/${PREFIX}/*" --query 'Invalidation.Id' --output text
+          }
+
+          # One comment per app, found by its hidden marker among this bot's comments and
+          # edited in place. Only ever written here, inside the group, from what was just done.
+          set_comment() {
+            local body="$1" create="$2" ids id
+            ids=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"${MARKER}\"))) | .id")
+            id="${ids%%$'\n'*}"
+            if [[ -n "$id" ]]; then
+              gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${id}" -f body="$body" --silent
+            elif [[ "$create" == "yes" ]]; then
+              gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -f body="$body" --silent
+            fi
+          }
+
+          do_publish() {
+            local sha="$1" run="$2"
+            rm -rf "${SITE_DIR}"
+            # --repo: this job has no checkout, so gh can't infer the repository from git.
+            gh run download "$run" --repo "$GITHUB_REPOSITORY" -n "$ARTIFACT_NAME" -D "${SITE_DIR}"
+            if [[ ! -f "${SITE_DIR}/index.html" ]]; then
+              echo "❌ Artifact '${ARTIFACT_NAME}' of run ${run} has no index.html at its root."
+              exit 1
+            fi
+            # Hashed bundles (Vite assets/, CRA static/) get a long cache; index.html goes last
+            # with no-cache. --delete keeps exactly one build in the folder (only this run writes
+            # it). Downloaded files are newer than the stored ones, so sync re-uploads all of
+            # them and none keeps an old date under the bucket's 14-day expiry.
+            local dir
+            for dir in assets static; do
+              if [[ -d "${SITE_DIR}/${dir}" ]]; then
+                aws s3 sync "${SITE_DIR}/${dir}" "${DEST}/${dir}/" --delete \
+                  --cache-control "public, max-age=31536000, immutable"
+              fi
+            done
+            aws s3 sync "${SITE_DIR}" "${DEST}/" --delete \
+              --exclude "index.html" --exclude "assets/*" --exclude "static/*"
+            aws s3 cp --cache-control "max-age=0, no-cache, no-store, must-revalidate" \
+              --content-type "text/html" "${SITE_DIR}/index.html" "${DEST}/index.html"
+            invalidate
+            set_comment "${MARKER}
+          ### 🔍 Preview (${APP_NAME}): ${PREVIEW_URL}
+
+          - **Commit:** \`${sha:0:7}\`
+          - **Published:** $(date -u '+%Y-%m-%d %H:%M UTC')
+          - Talks to the **stage API, stage data**.
+
+          Follows the newest commit that built; removed when the PR closes." yes
+          }
+
+          do_remove() {
+            aws s3 rm "${DEST}/" --recursive
+            invalidate
+            set_comment "${MARKER}
+          ### 🗑️ Preview (${APP_NAME}) removed
+
+          This PR is closed, so ${PREVIEW_URL} was deleted on $(date -u '+%Y-%m-%d %H:%M UTC')." no
+          }
+
+          applied=""
+          for round in 1 2 3 4 5; do
+            read_pr
+            # Our own build's run finding another head first: the API may still be catching up
+            # with the push, so give it a moment and read again before acting on it.
+            if [[ $round -eq 1 && "$STATE" == "open" && "$HEAD" != "$RUN_SHA" ]]; then
+              sleep "$SETTLE"
+              read_pr
+            fi
+            if [[ "$STATE" != "open" ]]; then
+              want="remove"
+            else
+              SRC=$(find_build "$HEAD") || { echo "❌ Could not look up builds of ${HEAD:0:7}"; exit 1; }
+              if [[ -n "$SRC" ]]; then want="publish ${HEAD} ${SRC}"; else want="wait ${HEAD}"; fi
+            fi
+            if [[ "$want" == "$applied" ]]; then
+              echo "✅ Preview matches the PR (${want})."
+              read -r MODE TARGET SOURCE <<< "$want"
+              { echo "mode=${MODE}"; echo "target_sha=${TARGET:-}"; echo "source_run=${SOURCE:-}"; } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "🔁 Round ${round}: PR is ${STATE} at ${HEAD:0:7}; doing: ${want}"
+            case "$want" in
+              remove) do_remove ;;
+              publish*) read -r _ SHA RUN <<< "$want"; do_publish "$SHA" "$RUN" ;;
+              wait*) echo "ℹ️  ${HEAD:0:7} has no build artifact yet (still building, failed or expired)." ;;
+            esac
+            applied="$want"
+            sleep "$SETTLE"
+          done
+          echo "❌ The PR kept changing for 5 rounds; rerun this job to finish."
+          exit 1
+
+      - name: Create preview summary
+        if: always()
+        env:
+          MODE: ${{ steps.reconcile.outputs.mode }}
+          TARGET_SHA: ${{ steps.reconcile.outputs.target_sha }}
+          SOURCE_RUN: ${{ steps.reconcile.outputs.source_run }}
+          PREVIEW_URL: ${{ steps.vars.outputs.url }}
+          PREFIX: ${{ steps.vars.outputs.prefix }}
+          DISTRIBUTION_ID: ${{ steps.cdn.outputs.id }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "## 🔍 PR preview ${PREVIEW_ACTION} (${APP_NAME})"
+            echo ""
+            echo "- **Status:** ${JOB_STATUS}"
+            echo "- **PR:** #${PR_NUMBER} (this run's commit ${RUN_SHA})"
+            case "$MODE" in
+              publish) echo "- **Live:** ${TARGET_SHA} from run ${SOURCE_RUN} at ${PREVIEW_URL} (stage API, stage data)" ;;
+              remove) echo "- **Removed:** the PR is closed" ;;
+              wait) echo "- **No change:** the PR's head ${TARGET_SHA} has no build artifact yet" ;;
+              *) echo "- **Not finished** (see the log)" ;;
+            esac
+            echo "- **S3:** s3://${BUCKET}/${PREFIX}/"
+            echo "- **CloudFront:** ${DISTRIBUTION_ID:-not looked up}"
+          } >> "$GITHUB_STEP_SUMMARY"
