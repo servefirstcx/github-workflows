@@ -19,19 +19,25 @@ that started it:
 
 - One run at a time per repo + PR + app (job-level concurrency group, never cancelled), so
   no two runs write the folder or the comment at once.
-- Holding the group, the run reads the PR. **Closed:** delete
-  `s3://preview.servefirst.co.uk/<app>/pr-<N>/`, invalidate it and mark the comment
-  removed. **Open:** publish the build of the PR's current head commit (hashed `assets/` and
-  `static/` with a long cache, `index.html` last with `no-cache`, `--delete` so the folder
-  holds exactly that build), invalidate `/<app>/pr-<N>/*` and point the comment at that
-  commit. The build artifact comes from whichever run of the caller workflow built that
-  commit, so a late run for an older commit publishes the newer one, never its own.
-  **Open, head not built yet:** change nothing; that build's own run publishes it.
-- GitHub keeps only the newest pending run in a group and drops older pending ones. That is
-  safe because the surviving run reconciles to the live state and so does the dropped run's
-  work. Every push, close and reopen starts a run after the change, so the last run to
-  execute always sees the final state. `publish` and `cleanup` differ only in when the
-  caller starts them.
+- Holding the group, the run reads the PR and acts. **Closed:** delete
+  `s3://preview.servefirst.co.uk/<app>/pr-<N>/`, invalidate it and mark the comment removed.
+  **Open:** publish the build of the PR's current head commit (hashed `assets/` and `static/`
+  with a long cache, `index.html` last with `no-cache`, `--delete` so the folder holds exactly
+  that build), invalidate `/<app>/pr-<N>/*` and point the comment at that commit. The build
+  comes from the newest run of the caller workflow for that commit that still has the
+  artifact, so a late run for an older commit publishes the newer one, never its own.
+  **Open, no build for the head yet:** leave the preview as it is.
+- Then it reads the PR again and repeats until a read agrees with what it last did, so a
+  stale API answer or a change mid-run is corrected in the same run. If the PR keeps
+  changing for 5 rounds the run fails; rerun it.
+- GitHub keeps only the newest pending run in a group and drops older pending ones. A run
+  only joins the group after its build uploaded the artifact, so the surviving run can still
+  publish a dropped run's build.
+- Limits, by design: a commit whose build fails keeps the previous preview (the comment names
+  the commit that is actually live); a build whose artifact has expired (the caller's
+  `retention-days`) can't be republished by a later run until the PR gets a new build, for
+  example after a reopen; old tabs may briefly request files of the previous build after a
+  publish (stage only, not an atomic switch).
 - Fork PRs and anything but `pull_request` events skip the job, so the deploy role is never assumed.
 
 Fixed in the workflow (no secrets or repo variables needed): role
