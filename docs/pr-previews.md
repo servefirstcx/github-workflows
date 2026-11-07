@@ -1,11 +1,12 @@
 # PR previews (`pr-preview.yml`)
 
-Every pull request into `stage` gets its own copy of the web app or admin app:
+Every pull request into `stage` gets its own copy of the web app, admin app or survey site:
 
 | App | Repo | Preview URL for PR N |
 |-----|------|----------------------|
 | `app` | sf-react-app | `https://app-pr-N.preview.servefirst.co.uk` |
 | `admin` | sf-admin | `https://admin-pr-N.preview.servefirst.co.uk` |
+| `front` | front-ratings | `https://front-pr-N.preview.servefirst.co.uk` |
 
 Previews talk to the **stage API, with stage data**. The PR gets one comment with the
 link and the commit it shows, edited in place on every push. When the PR closes
@@ -43,7 +44,7 @@ that started it:
 
 Fixed in the workflow (no secrets or repo variables needed): role
 `arn:aws:iam::068531097348:role/stage-github-actions-preview` (trusts only
-`sf-react-app` and `sf-admin` `pull_request` runs), bucket `preview.servefirst.co.uk`,
+`sf-react-app`, `sf-admin` and `front-ratings` `pull_request` runs), bucket `preview.servefirst.co.uk`,
 region `eu-west-2`, and the CloudFront distribution found by its alias
 `*.preview.servefirst.co.uk`.
 
@@ -116,3 +117,10 @@ Notes:
 - Use the same `artifact_name` for publish and cleanup: it is how a run finds another run's build.
 - Don't add a `concurrency` group with `cancel-in-progress` around the publish or cleanup
   jobs in the caller: cancelling them is what the shared job's design avoids.
+- front-ratings keeps its stage build settings in the `staging` environment's `BUILD_ENV_VARS`
+  secret, not in a committed env file, so its build job runs with
+  `environment: { name: staging, deployment: false }` and parses that secret the same way
+  `deploy-s3-cloudfront.yml` does (no staging deployment is recorded on the PR). Its
+  `isPlatformHost` (`src/helpers/apiBase.js`) also lists `front-pr-N.preview.servefirst.co.uk`,
+  otherwise the build would call the same-origin `/api` used on customer custom domains, which
+  the preview distribution does not route.
