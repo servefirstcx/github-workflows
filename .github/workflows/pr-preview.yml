@@ -25,7 +25,7 @@ on:
   workflow_call:
     inputs:
       app_name:
-        description: "Preview app: 'app' (sf-react-app) or 'admin' (sf-admin)"
+        description: "Preview app: 'app' (sf-react-app), 'admin' (sf-admin) or 'front' (front-ratings)"
         required: true
         type: string
       artifact_name:
@@ -78,8 +78,8 @@ jobs:
         run: |
           set -euo pipefail
           case "$APP_NAME" in
-            app|admin) ;;
-            *) echo "❌ app_name must be 'app' or 'admin', got '$APP_NAME'"; exit 1 ;;
+            app|admin|front) ;;
+            *) echo "❌ app_name must be 'app', 'admin' or 'front', got '$APP_NAME'"; exit 1 ;;
           esac
           case "$PREVIEW_ACTION" in
             publish|cleanup) ;;
