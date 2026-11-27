@@ -9,7 +9,9 @@ Every pull request into `stage` gets its own copy of the web app, admin app or s
 | `front` | front-ratings | `https://front-pr-N.preview.servefirst.ai` |
 
 Old `https://<app>-pr-N.preview.servefirst.co.uk` links (before SF-5585) redirect to the same
-page on `.ai`.
+page on `.ai`. A preview built before the move keeps that older build until the PR gets a new
+commit (push, or merge `stage` into it): the survey site and the web app's pictures need the
+build made for `.ai`, since the build is made from the PR's own commit.
 
 Previews talk to the **stage API, with stage data**. The PR gets one comment with the
 link and the commit it shows, edited in place on every push. When the PR closes
