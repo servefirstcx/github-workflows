@@ -1,7 +1,9 @@
 name: Reusable PR Preview Workflow
 
 # Keeps a per-PR preview on stage in step with the PR:
-#   https://<app>-pr-<N>.preview.servefirst.co.uk -> s3://preview.servefirst.co.uk/<app>/pr-<N>/
+#   https://<app>-pr-<N>.preview.servefirst.ai -> s3://preview.servefirst.co.uk/<app>/pr-<N>/
+# (SF-5585: on servefirst.ai like stage; the old .preview.servefirst.co.uk links redirect there.
+# The bucket keeps its old name, it is never shown.)
 # The preview talks to the stage API and stage data. Caller wiring: docs/pr-previews.md.
 #
 # How it stays correct when runs arrive late, overlap or are dropped:
@@ -68,7 +70,7 @@ jobs:
       AWS_ROLE: arn:aws:iam::068531097348:role/stage-github-actions-preview
       BUCKET: preview.servefirst.co.uk
       AWS_REGION_NAME: eu-west-2
-      PREVIEW_ALIAS: "*.preview.servefirst.co.uk"
+      PREVIEW_ALIAS: "*.preview.servefirst.ai"
       SITE_DIR: preview-site
       GH_TOKEN: ${{ github.token }}
 
@@ -95,7 +97,7 @@ jobs:
           fi
           {
             echo "prefix=${APP_NAME}/pr-${PR_NUMBER}"
-            echo "url=https://${APP_NAME}-pr-${PR_NUMBER}.preview.servefirst.co.uk"
+            echo "url=https://${APP_NAME}-pr-${PR_NUMBER}.preview.servefirst.ai"
             echo "marker=<!-- pr-preview:${APP_NAME} -->"
           } >> "$GITHUB_OUTPUT"
 
