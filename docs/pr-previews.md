@@ -4,9 +4,16 @@ Every pull request into `stage` gets its own copy of the web app, admin app or s
 
 | App | Repo | Preview URL for PR N |
 |-----|------|----------------------|
-| `app` | sf-react-app | `https://app-pr-N.preview.servefirst.co.uk` |
-| `admin` | sf-admin | `https://admin-pr-N.preview.servefirst.co.uk` |
-| `front` | front-ratings | `https://front-pr-N.preview.servefirst.co.uk` |
+| `app` | sf-react-app | `https://app-pr-N.preview.servefirst.ai` |
+| `admin` | sf-admin | `https://admin-pr-N.preview.servefirst.ai` |
+| `front` | front-ratings | `https://front-pr-N.preview.servefirst.ai` |
+
+Old `https://<app>-pr-N.preview.servefirst.co.uk` links (before SF-5585) redirect to the same
+page on `.ai`. The build is made from the PR's own commit, so a branch made before the `.ai`
+changes reached `stage` can stay broken on `.ai` even after a new push or a rerun (the survey
+site can't reach the API; web app pictures may be missing). To fix one: merge or rebase the
+current `stage` into the PR, push, and wait for the preview to publish. An unrelated new commit
+or rerunning the old commit does not fix it.
 
 Previews talk to the **stage API, with stage data**. The PR gets one comment with the
 link and the commit it shows, edited in place on every push. When the PR closes
@@ -46,7 +53,8 @@ Fixed in the workflow (no secrets or repo variables needed): role
 `arn:aws:iam::068531097348:role/stage-github-actions-preview` (trusts only
 `sf-react-app`, `sf-admin` and `front-ratings` `pull_request` runs), bucket `preview.servefirst.co.uk`,
 region `eu-west-2`, and the CloudFront distribution found by its alias
-`*.preview.servefirst.co.uk`.
+`*.preview.servefirst.ai`. The bucket keeps its old `.co.uk` name: S3 names can't change and it
+is never shown.
 
 ## Caller wiring
 
@@ -121,6 +129,6 @@ Notes:
   secret, not in a committed env file, so its build job runs with
   `environment: { name: staging, deployment: false }` and parses that secret the same way
   `deploy-s3-cloudfront.yml` does (no staging deployment is recorded on the PR). Its
-  `isPlatformHost` (`src/helpers/apiBase.js`) also lists `front-pr-N.preview.servefirst.co.uk`,
+  `isPlatformHost` (`src/helpers/apiBase.js`) also lists `front-pr-N.preview.servefirst.ai`,
   otherwise the build would call the same-origin `/api` used on customer custom domains, which
   the preview distribution does not route.

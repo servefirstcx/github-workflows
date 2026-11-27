@@ -95,7 +95,7 @@ function reconcile({action = 'publish', runSha = A, reads, builds = {}, comment 
       PREVIEW_ACTION: action, RUN_SHA: runSha, ARTIFACT_NAME: 'preview-site', APP_NAME: 'admin',
       CALLER_WORKFLOW_REF: 'servefirstcx/sf-admin/.github/workflows/pr-preview.yml@refs/pull/7/merge',
       BUCKET: 'bucket', PREFIX: 'admin/pr-7', SITE_DIR: 'site', DISTRIBUTION_ID: 'D1',
-      MARKER: '<!-- pr-preview:admin -->', PREVIEW_URL: 'https://admin-pr-7.preview.servefirst.co.uk'},
+      MARKER: '<!-- pr-preview:admin -->', PREVIEW_URL: 'https://admin-pr-7.preview.servefirst.ai'},
   });
   const calls = readFileSync(log, 'utf8').trim().split('\n').filter(Boolean);
   const outputs = Object.fromEntries(readFileSync(out, 'utf8').split('\n').filter(Boolean).map(l => l.split('=')));
@@ -212,4 +212,16 @@ test('one run at a time per PR and app, never cancelled; pull_request events onl
   assert.match(workflow, /\n {2}actions: read\n/);
   const outside = workflow.replace(stepBlock('Reconcile the preview with the PR'), '');
   assert.doesNotMatch(outside, /aws s3 |issues\/comments/, 'S3 and comment writes happen only in the reconcile step');
+});
+
+test('previews are published on servefirst.ai, found by the .ai alias (SF-5585)', () => {
+  const out = join(dir, 'vars-out');
+  writeFileSync(out, '');
+  const r = spawnSync('bash', ['-c', stepScript('Validate inputs')], {
+    encoding: 'utf8',
+    env: {...process.env, GITHUB_OUTPUT: out, APP_NAME: 'front', PREVIEW_ACTION: 'publish', ARTIFACT_NAME: 'x', PR_NUMBER: '42'},
+  });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(readFileSync(out, 'utf8'), /^url=https:\/\/front-pr-42\.preview\.servefirst\.ai$/m);
+  assert.match(workflow, /\n {6}PREVIEW_ALIAS: "\*\.preview\.servefirst\.ai"\n/);
 });

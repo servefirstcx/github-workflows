@@ -78,10 +78,11 @@ deploy role needs `cloudfront:ListDistributionTenants` and
 ### 7. PR Preview Workflow (`pr-preview.yml`)
 
 Publishes an already built static site as a per-PR preview on stage
-(`https://app-pr-N.preview.servefirst.co.uk` for sf-react-app,
-`https://admin-pr-N.preview.servefirst.co.uk` for sf-admin), keeps one sticky PR
+(`https://app-pr-N.preview.servefirst.ai` for sf-react-app,
+`https://admin-pr-N.preview.servefirst.ai` for sf-admin,
+`https://front-pr-N.preview.servefirst.ai` for front-ratings), keeps one sticky PR
 comment with the link and commit, and deletes the preview when the PR closes. Callers
-pass `app_name` (`app` or `admin`), `artifact_name` and `action` (`publish` or
+pass `app_name` (`app`, `admin` or `front`), `artifact_name` and `action` (`publish` or
 `cleanup`) and grant `id-token: write`, `contents: read`, `pull-requests: write` and `actions: read`.
 See [PR previews](docs/pr-previews.md) for the caller example.
 
